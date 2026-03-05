@@ -305,6 +305,20 @@ export class Evolver {
     const result = workspace.commitAndPush(issue, prTitle);
 
     if (!result.changed || !result.pushed) {
+      if (existingPr && !result.changed) {
+        this.logger.warn("Execution follow-up produced no publishable diff", {
+          issueNumber: issue.number,
+          prNumber: existingPr.number,
+          reason: result.reason ?? "unknown"
+        });
+        return {
+          pr: existingPr,
+          commitSha: null,
+          changed: false,
+          reason: result.reason ?? "No new diff was produced."
+        };
+      }
+
       this.logger.error("Execution could not be published", {
         issueNumber: issue.number,
         reason: result.reason ?? "unknown"
@@ -319,7 +333,7 @@ export class Evolver {
         body: prBody
       });
       await this.log(issue.number, `🔄 Updated PR #${pr.number} from branch ${result.branchName}.`);
-      return { pr, commitSha: result.commitSha };
+      return { pr, commitSha: result.commitSha, changed: true };
     }
 
     pr = await this.github.createPullRequest({
@@ -329,7 +343,7 @@ export class Evolver {
       base: "main"
     });
     await this.log(issue.number, `📬 Opened PR #${pr.number} from branch ${result.branchName}.`);
-    return { pr, commitSha: result.commitSha };
+    return { pr, commitSha: result.commitSha, changed: true };
   }
 
   async reviewMergeAndRestart(issue, pr, workspace, validation, execution) {
@@ -407,6 +421,25 @@ export class Evolver {
       }
 
       const publication = await this.publishExecution(issue, workspace, currentExecution, currentPr);
+      if (!publication.changed) {
+        this.logger.warn("Review fix round produced no new diff", {
+          issueNumber: issue.number,
+          prNumber: currentPr.number,
+          round,
+          reason: publication.reason ?? "unknown"
+        });
+        await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
+        await this.log(
+          issue.number,
+          `⛔ Review-requested fix round produced no new diff. Existing PR #${currentPr.number} was left unchanged. Added label: ${NEEDS_HUMAN_LABEL}.${publication.reason ? ` reason: ${publication.reason}` : ""}`
+        );
+        return {
+          restartRequested: false,
+          halted: false,
+          reviewRounds: round,
+          validationPassed: Boolean(currentValidation?.passed)
+        };
+      }
       currentPr = publication.pr;
     }
 

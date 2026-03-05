@@ -355,6 +355,7 @@ export class Workspace {
       branchName: this.branchName,
       commitSha
     });
+    this.touchedFiles.clear();
     return {
       changed: true,
       pushed: true,

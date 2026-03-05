@@ -70,6 +70,8 @@ class StubWorkspace {
     this.branchName = options.branchName ?? "evolvo/issue-11-implement-thing";
     this.validationResults = options.validationResults ?? [{ passed: true, summary: "ok" }];
     this.validationIndex = 0;
+    this.commitResults = options.commitResults ?? null;
+    this.commitIndex = 0;
     this.touchedFiles = [];
     this.cleaned = false;
     this.commitCalls = [];
@@ -128,11 +130,24 @@ class StubWorkspace {
 
   commitAndPush(issue, prTitle) {
     this.commitCalls.push({ issueNumber: issue.number, prTitle, touchedFiles: [...this.touchedFiles] });
-    return {
+    const configured = this.commitResults?.[Math.min(this.commitIndex, this.commitResults.length - 1)];
+    this.commitIndex += 1;
+
+    const result = configured ?? {
       changed: this.touchedFiles.length > 0,
       pushed: this.touchedFiles.length > 0,
       branchName: this.branchName,
       commitSha: "abc123"
+    };
+
+    if (result.changed) {
+      this.touchedFiles = [];
+    }
+
+    return {
+      branchName: this.branchName,
+      commitSha: "abc123",
+      ...result
     };
   }
 
@@ -256,6 +271,44 @@ test("Evolver runs another fix cycle when self-review requests changes", async (
   assert.equal(github.updatedPullRequests.length, 1);
   assert.equal(github.pullRequestComments.length, 2);
   assert.equal(performance.snapshots[0].reviewRounds, 2);
+});
+
+test("Evolver labels the issue when a review follow-up produces no new diff", async () => {
+  const workspace = new StubWorkspace({
+    validationResults: [
+      { passed: true, summary: "initial validation ok" },
+      { passed: true, summary: "follow-up validation ok" }
+    ],
+    commitResults: [
+      { changed: true, pushed: true, branchName: "evolvo/issue-11-implement-thing", commitSha: "abc123" },
+      { changed: false, pushed: false, branchName: "evolvo/issue-11-implement-thing", reason: "No touched files were recorded." }
+    ]
+  });
+  const { evolver, github, performance } = createEvolver({
+    plannerResponses: [
+      '{"action":"work","issueNumber":11}',
+      '{"action":"write_file","path":"src/feature.js","content":"export const feature = true;"}',
+      '{"action":"run_validation"}',
+      '{"action":"finish","summary":"implemented","prTitle":"Implement thing"}',
+      '{"action":"run_validation"}',
+      '{"action":"finish","summary":"rechecked review feedback","rationale":"no additional safe diff identified","prTitle":"Implement thing"}'
+    ],
+    reviewerResponses: [
+      '{"decision":"request_changes","body":"Please adjust the feature","rationale":"needs revision"}'
+    ],
+    workspace
+  });
+
+  const result = await evolver.run();
+
+  assert.equal(result.restartRequested, false);
+  assert.equal(github.createdPullRequests.length, 1);
+  assert.equal(github.updatedPullRequests.length, 0);
+  assert.ok(github.labels.some((entry) => entry.labels.includes("needs-human-intervention")));
+  assert.match(github.comments.at(-1).message, /produced no new diff/i);
+  assert.equal(performance.snapshots[0].reviewRounds, 1);
+  assert.equal(performance.snapshots[0].merged, false);
+  assert.equal(workspace.cleaned, true);
 });
 
 test("Evolver labels the issue when validation never reaches a passing finish", async () => {

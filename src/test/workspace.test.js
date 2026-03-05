@@ -107,3 +107,24 @@ test("Workspace stages only touched files", () => {
     rmSync(remoteDir, { recursive: true, force: true });
   }
 });
+
+test("Workspace clears touched files after a successful publish", () => {
+  const { repoDir, remoteDir } = createRepo();
+  const workspace = new Workspace(repoDir, {
+    githubToken: "unused-for-file-remote",
+    commandTimeoutMs: 10000
+  });
+
+  try {
+    workspace.prepareBranch({ number: 3, title: "Implement worker", body: "" });
+    writeFileSync(join(repoDir, "src", "a.js"), "export const a = 2;\n");
+    workspace.writeFile("src/a.js", "export const a = 2;\n");
+    const result = workspace.commitAndPush({ number: 3, title: "Implement worker" }, "Implement worker");
+
+    assert.equal(result.changed, true);
+    assert.deepEqual(workspace.getTouchedFiles(), []);
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
