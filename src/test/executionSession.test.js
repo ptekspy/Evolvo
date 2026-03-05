@@ -65,7 +65,7 @@ class StubWorkspace {
 
 test("ExecutionSession completes a valid action loop", async () => {
   const planner = new SequenceModel([
-    '{"action":"write_file","path":"src/feature.js","content":"export const feature = true;"}',
+    '{"action":"write_file","path":"src/feature.ts","content":"export const feature = true;"}',
     '{"action":"run_validation"}',
     '{"action":"finish","summary":"implemented feature","rationale":"added feature","prTitle":"Add feature"}'
   ]);
@@ -81,10 +81,10 @@ test("ExecutionSession completes a valid action loop", async () => {
 
 test("ExecutionSession retries within the same session after validation failure", async () => {
   const planner = new SequenceModel([
-    '{"action":"write_file","path":"src/feature.js","content":"broken"}',
+    '{"action":"write_file","path":"src/feature.ts","content":"broken"}',
     '{"action":"run_validation"}',
     '{"action":"finish","summary":"done"}',
-    '{"action":"write_file","path":"src/feature.js","content":"fixed"}',
+    '{"action":"write_file","path":"src/feature.ts","content":"fixed"}',
     '{"action":"run_validation"}',
     '{"action":"finish","summary":"done","rationale":"after fixing validation"}'
   ]);
