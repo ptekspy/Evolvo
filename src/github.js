@@ -187,6 +187,24 @@ export class GitHubClient {
     });
   }
 
+  async commentOnPullRequest(prNumber, message) {
+    if (this.options.dryRun) {
+      this.logger.info("Dry-run pull request comment", {
+        prNumber,
+        message
+      });
+      return;
+    }
+
+    await this.request(`/issues/${prNumber}/comments`, {
+      method: "POST",
+      body: { body: message }
+    });
+    this.logger.debug("Posted pull request comment", {
+      prNumber
+    });
+  }
+
   async listOpenPullRequests() {
     if (this.options.dryRun) {
       const pullRequests = this.dryRunPullRequests.filter((pullRequest) => pullRequest.state === "open");
@@ -291,28 +309,6 @@ export class GitHubClient {
       found: Boolean(pullRequest)
     });
     return pullRequest;
-  }
-
-  async reviewPullRequest(prNumber, review) {
-    if (this.options.dryRun) {
-      this.logger.info("Dry-run pull request review submitted", {
-        prNumber,
-        decision: review.decision
-      });
-      return;
-    }
-
-    await this.request(`/pulls/${prNumber}/reviews`, {
-      method: "POST",
-      body: {
-        event: review.decision === "approve" ? "APPROVE" : "REQUEST_CHANGES",
-        body: review.body
-      }
-    });
-    this.logger.info("Submitted pull request review", {
-      prNumber,
-      decision: review.decision
-    });
   }
 
   async mergePullRequest(prNumber) {

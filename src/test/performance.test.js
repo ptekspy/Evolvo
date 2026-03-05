@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PerformanceTracker } from "../performance.js";
 
-const file = ".evolvo/test-performance.json";
-
 test("PerformanceTracker records and returns latest snapshot", () => {
-  rmSync(file, { force: true });
+  const folder = mkdtempSync(join(tmpdir(), "evolvo-performance-"));
+  const file = join(folder, "performance.json");
   const tracker = new PerformanceTracker(file);
 
   tracker.record({
@@ -20,4 +21,5 @@ test("PerformanceTracker records and returns latest snapshot", () => {
   const latest = tracker.latest();
   assert.ok(latest);
   assert.equal(latest.benchmarkScore, 0.5);
+  rmSync(folder, { recursive: true, force: true });
 });

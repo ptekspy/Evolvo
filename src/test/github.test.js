@@ -58,3 +58,16 @@ test("GitHubClient dry-run merge and close update local state", async () => {
   assert.equal((await client.listOpenPullRequests()).length, 0);
   assert.equal((await client.listOpenIssues()).length, 0);
 });
+
+test("GitHubClient supports pull request comments in dry-run mode", async () => {
+  const client = new GitHubClient({ owner: "o", repo: "r", token: "t", dryRun: true });
+  const pullRequest = await client.createPullRequest({
+    title: "Implement thing",
+    body: "Closes #1",
+    head: "branch",
+    base: "main"
+  });
+
+  await client.commentOnPullRequest(pullRequest.number, "Automated self-review");
+  assert.equal((await client.getPullRequest(pullRequest.number)).number, pullRequest.number);
+});

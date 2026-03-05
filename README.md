@@ -24,7 +24,7 @@ Evolvo runs continuously until the process is stopped or it restarts itself afte
 3. Use a constrained action loop to inspect files, edit code, and run validation.
 4. Commit only the touched files and push the issue branch with token-based git auth.
 5. Create or update a PR with a controlled `Closes #<issue>` marker.
-6. Self-review the PR against the diff plus validation output. If changes are requested, run another fix cycle and update the PR.
+6. Self-review the PR against the diff plus validation output, post that review as a PR comment, and if changes are requested run another fix cycle and update the PR.
 7. Auto-merge only when the latest validation passes and the self-review approves the PR.
 8. If blocked after retries, label the issue `needs-human-intervention`.
 9. If no actionable issues exist, self-analyze and create deduped self-evolution issues.
@@ -54,6 +54,7 @@ DRY_RUN=true
 ## Requirements
 
 - The repo must be clean before a live run. Untracked `.env*` files and `.evolvo/` are allowed; other local changes will block execution.
+- `.evolvo/` is runtime state and should stay untracked.
 - `pnpm start` loads `.env` automatically on Node 22+.
 - The configured GitHub token must have issue, PR, and push permissions for the target repo.
 - `PRIMARY_MODEL_PROVIDER=openai` requires `OPENAI_API_KEY`.

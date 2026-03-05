@@ -24,7 +24,7 @@ class StubGitHub {
     this.created = [];
     this.createdPullRequests = [];
     this.updatedPullRequests = [];
-    this.reviews = [];
+    this.pullRequestComments = [];
     this.merged = [];
     this.issue = { number: 11, title: "Implement thing", body: "details", labels: [] };
     this.pr = null;
@@ -48,7 +48,7 @@ class StubGitHub {
     this.updatedPullRequests.push({ prNumber, data });
     return this.pr;
   }
-  async reviewPullRequest(prNumber, review) { this.reviews.push({ prNumber, review }); }
+  async commentOnPullRequest(prNumber, message) { this.pullRequestComments.push({ prNumber, message }); }
   async mergePullRequest(prNumber) { this.merged.push(prNumber); return true; }
   async createIssue(title, body) { this.created.push({ title, body }); return 99; }
 }
@@ -196,6 +196,7 @@ test("Evolver opens, reviews, and merges a PR after executing an issue", async (
 
   assert.equal(result.restartRequested, true);
   assert.equal(github.createdPullRequests.length, 1);
+  assert.equal(github.pullRequestComments.length, 1);
   assert.deepEqual(github.merged, [44]);
   assert.deepEqual(github.closed, [11]);
   assert.equal(performance.snapshots[0].merged, true);
@@ -253,7 +254,7 @@ test("Evolver runs another fix cycle when self-review requests changes", async (
   assert.equal(result.restartRequested, true);
   assert.equal(github.createdPullRequests.length, 1);
   assert.equal(github.updatedPullRequests.length, 1);
-  assert.equal(github.reviews.length, 2);
+  assert.equal(github.pullRequestComments.length, 2);
   assert.equal(performance.snapshots[0].reviewRounds, 2);
 });
 

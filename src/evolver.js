@@ -36,6 +36,17 @@ function buildPullRequestBody(issue, execution) {
   return ensureIssueMarker(sections.join("\n\n"), issue.number);
 }
 
+function formatReviewComment(review, round, maxRounds) {
+  return [
+    `Automated self-review round ${round}/${maxRounds}`,
+    `Decision: ${review.decision}`,
+    "",
+    review.body ?? "No review body provided.",
+    "",
+    `Rationale: ${review.rationale ?? "n/a"}`
+  ].join("\n");
+}
+
 export class Evolver {
   constructor(planner, reviewer, github, performance, options = {}) {
     this.planner = planner;
@@ -333,7 +344,10 @@ export class Evolver {
         round
       });
       const review = await this.generateReview(issue, currentPr, round, workspace, currentValidation);
-      await this.github.reviewPullRequest(currentPr.number, review);
+      await this.github.commentOnPullRequest(
+        currentPr.number,
+        formatReviewComment(review, round, this.options.maxPrFixRounds)
+      );
       await this.log(issue.number, `🔍 Review round ${round}/${this.options.maxPrFixRounds}: ${review.decision}. rationale: ${review.rationale ?? "n/a"}`);
 
       if (review.decision === "approve") {
