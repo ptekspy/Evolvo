@@ -31,6 +31,24 @@ Evolvo runs continuously until the process is stopped or it restarts itself afte
 
 All progress is posted as timestamped comments on the issue being worked.
 
+## Human challenge benchmark issue
+
+To benchmark Evolvo capability growth, create a human-defined issue with a clear acceptance bar. Suggested format:
+
+- **Title:** `Challenge: <capability area>`
+- **Scope:** one concrete feature or reliability improvement
+- **Constraints:** TypeScript-only product changes, no fabricated results
+- **Acceptance criteria:** explicit behavior + test expectations
+- **Evidence required:** validation summary and rationale (intent, trade-offs, evidence, next step)
+
+Example challenge:
+
+- Implement a resilient provider failover improvement that retries Ollama before OpenAI escalation.
+- Add unit tests covering retry exhaustion and successful fallback.
+- Update issue/PR rationale quality so logs always include intent, trade-offs, evidence, and next step.
+
+This gives Evolvo a measurable target for the next evolution step and makes progress comparable over time.
+
 ## Environment
 
 ```bash
