@@ -42,6 +42,28 @@ function classifyError(error) {
   return "other";
 }
 
+function isRetryableErrorCategory(category) {
+  return category === "timeout" || category === "network";
+}
+
+function createTimeoutSignal(timeoutMs) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return { signal: AbortSignal.timeout(timeoutMs), cleanup() {} };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Timeout after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+    }
+  };
+}
+
 export class OllamaProvider {
   constructor(baseUrl, model = "qwen-coder-3:30b", logger = createNoopLogger(), options = {}) {
     this.baseUrl = baseUrl;
@@ -60,11 +82,12 @@ export class OllamaProvider {
   async probeHealth() {
     const startedAt = this.now();
     const timeout = this.retryPolicy.warmupTimeoutMs;
+    const { signal, cleanup } = createTimeoutSignal(timeout);
 
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/api/tags`, {
         method: "GET",
-        signal: AbortSignal.timeout(timeout)
+        signal
       });
 
       const healthy = response.ok;
@@ -99,6 +122,8 @@ export class OllamaProvider {
         error
       });
       throw error;
+    } finally {
+      cleanup();
     }
   }
 
@@ -187,8 +212,16 @@ export class OllamaProvider {
         });
         return output;
       } catch (error) {
+        const alreadyCapturedHttpError = error instanceof Error && /Ollama request failed: status=\d+/.test(error.message);
+        if (alreadyCapturedHttpError) {
+          if (error && typeof error === "object") {
+            error.attemptTelemetry = telemetry;
+          }
+          throw error;
+        }
+
         const category = classifyError(error);
-        const retryable = attempt < attempts;
+        const retryable = attempt < attempts && isRetryableErrorCategory(category);
         telemetry.push({
           attempt,
           ok: false,
