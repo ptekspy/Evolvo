@@ -8,6 +8,34 @@ import { PerformanceTracker } from "./performance.js";
 import { createAgentProviders } from "./providerSelection.js";
 import { Workspace } from "./workspace.js";
 
+export function installDependencies(options = {}) {
+  const spawnImpl = options.spawnImpl ?? spawn;
+  const child = spawnImpl(options.command ?? "pnpm", options.args ?? ["install", "--frozen-lockfile"], {
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? process.env,
+    stdio: "inherit"
+  });
+
+  if (typeof child?.status === "number" && child.status !== 0) {
+    throw new Error(`Dependency installation failed with exit code ${child.status}.`);
+  }
+
+  if (typeof child?.on === "function") {
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        options.logger?.warn?.("Dependency installation exited with non-zero code", { code });
+      }
+    });
+  }
+
+  options.logger?.info?.("Dependency installation started", {
+    command: options.command ?? "pnpm",
+    args: options.args ?? ["install", "--frozen-lockfile"]
+  });
+
+  return child;
+}
+
 export function restartProcess(options = {}) {
   const spawnImpl = options.spawnImpl ?? spawn;
   const child = spawnImpl(
@@ -89,7 +117,17 @@ export async function main(dependencies = {}) {
       return outcome;
     }
 
-    logger.info("Restart requested after merge; launching replacement process.");
+    logger.info("Restart requested after merge; installing dependencies before relaunch.");
+    (dependencies.installDependencies ?? installDependencies)({
+      logger,
+      spawnImpl: dependencies.spawnImpl,
+      command: dependencies.installCommand,
+      args: dependencies.installArgs,
+      cwd: dependencies.cwd,
+      env: dependencies.env
+    });
+
+    logger.info("Dependency install step complete; launching replacement process.");
     (dependencies.restartProcess ?? restartProcess)({
       logger,
       spawnImpl: dependencies.spawnImpl,
