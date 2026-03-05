@@ -11,8 +11,9 @@ Evolvo runs one command (`pnpm start`) and operates as a GitHub-native engineeri
 Evolvo now uses a centralized `MASTER_PROMPT` (see `src/masterPrompt.js`) that defines identity, autonomy, quality gates, TypeScript-only policy, perseverance before OpenAI escalation, and rich rationale-based communication in issue logs.
 
 
-- **Primary model:** Ollama `qwen-coder-3:30b`.
-- **Escalation model:** OpenAI `gpt-5.3-codex` only when the primary model fails/stalls.
+- **Primary model:** configurable with `PRIMARY_MODEL_PROVIDER=ollama|openai`.
+- **Default primary:** Ollama `qwen-coder-3:30b`.
+- **Fallback model:** whichever other provider is configured and available.
 
 ## Autonomous cycle (continuous)
 
@@ -36,6 +37,7 @@ All progress is posted as timestamped comments on the issue being worked.
 GITHUB_OWNER=your-org-or-user
 GITHUB_REPO=your-repo
 GITHUB_TOKEN=ghp_xxx
+PRIMARY_MODEL_PROVIDER=ollama
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.3-codex
 OLLAMA_BASE_URL=http://127.0.0.1:11434
@@ -54,6 +56,7 @@ DRY_RUN=true
 - The repo must be clean before a live run. Untracked `.env*` files and `.evolvo/` are allowed; other local changes will block execution.
 - `pnpm start` loads `.env` automatically on Node 22+.
 - The configured GitHub token must have issue, PR, and push permissions for the target repo.
+- `PRIMARY_MODEL_PROVIDER=openai` requires `OPENAI_API_KEY`.
 - Console logging is controlled by `LOG_LEVEL` with `debug`, `info`, `warn`, and `error`.
 
 ## Run

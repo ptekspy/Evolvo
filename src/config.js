@@ -6,11 +6,21 @@ function requireEnv(name) {
   return value;
 }
 
+function readPrimaryModelProvider() {
+  const value = (process.env.PRIMARY_MODEL_PROVIDER ?? "ollama").toLowerCase();
+  if (value !== "ollama" && value !== "openai") {
+    throw new Error(`Invalid PRIMARY_MODEL_PROVIDER: ${value}. Expected "ollama" or "openai".`);
+  }
+
+  return value;
+}
+
 export function readConfig() {
   return {
     githubOwner: requireEnv("GITHUB_OWNER"),
     githubRepo: requireEnv("GITHUB_REPO"),
     githubToken: requireEnv("GITHUB_TOKEN"),
+    primaryModelProvider: readPrimaryModelProvider(),
     openAiApiKey: process.env.OPENAI_API_KEY,
     ollamaBaseUrl: process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
     ollamaModel: process.env.OLLAMA_MODEL ?? "qwen-coder-3:30b",

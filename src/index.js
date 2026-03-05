@@ -3,9 +3,7 @@ import { Evolver } from "./evolver.js";
 import { GitHubClient } from "./github.js";
 import { ConsoleLogger } from "./logger.js";
 import { PerformanceTracker } from "./performance.js";
-import { FallbackProvider } from "./providers/fallback.js";
-import { OllamaProvider } from "./providers/ollama.js";
-import { OpenAiProvider } from "./providers/openai.js";
+import { createAgentProviders } from "./providerSelection.js";
 import { Workspace } from "./workspace.js";
 
 async function main() {
@@ -19,6 +17,7 @@ async function main() {
   logger.info("Loaded configuration", {
     repo: `${config.githubOwner}/${config.githubRepo}`,
     dryRun: config.dryRun,
+    primaryModelProvider: config.primaryModelProvider,
     ollamaModel: config.ollamaModel,
     openAiModel: config.openAiModel,
     openAiFallback: Boolean(config.openAiApiKey),
@@ -30,13 +29,7 @@ async function main() {
     logLevel: config.logLevel
   });
 
-  const ollama = new OllamaProvider(config.ollamaBaseUrl, config.ollamaModel, logger.child("provider.ollama"));
-  const openAiFallback = config.openAiApiKey
-    ? new OpenAiProvider(config.openAiApiKey, config.openAiModel, logger.child("provider.openai"))
-    : null;
-
-  const planner = new FallbackProvider(ollama, openAiFallback, logger.child("planner"));
-  const reviewer = new FallbackProvider(ollama, openAiFallback, logger.child("reviewer"));
+  const { planner, reviewer } = createAgentProviders(config, logger.child("models"));
 
   const evolver = new Evolver(
     planner,
