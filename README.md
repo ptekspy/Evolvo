@@ -2,6 +2,26 @@
 
 Evolvo runs one command (`pnpm start`) and operates as a GitHub-native engineering loop that can branch locally, edit files, validate changes, open/update PRs, self-review, and auto-merge.
 
+## Current instruction thread (Issue #21)
+
+**Next meaningful development outcome:**
+
+Build and merge a production-ready TypeScript migration baseline by converting core `.js` source modules to `.ts`, keeping behavior unchanged, and ensuring tests and build validation pass.
+
+### Acceptance criteria
+
+- Migrate an initial vertical slice of runtime code from JavaScript to TypeScript (at minimum: prompt composition, provider selection boundary, and one orchestration entry path).
+- Keep existing autonomous loop behavior functionally equivalent (no fabricated outcomes; no regression in issue/PR flow logic).
+- Add or update tests to cover migrated TypeScript modules and preserve current behavioral assertions.
+- Ensure the validation gate passes (`tests pass` and `build/typecheck passes`) before merge.
+- Open/update PR with rationale quality including: **Intent, Trade-offs, Evidence, Next step**.
+
+### Why this is the right next step
+
+- The master policy already requires TypeScript-only implementation for modified/generated product code.
+- A focused migration baseline unlocks safer future self-evolution by introducing stronger static guarantees where orchestration decisions are made.
+- This outcome is measurable and benchmark-friendly for future challenge issues.
+
 ## Default model policy
 
 - Evolvo runs with a persistent master instruction contract to keep behavior consistent across decisions.
