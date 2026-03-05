@@ -337,3 +337,35 @@ test("Evolver labels the issue when validation never reaches a passing finish", 
   assert.equal(github.merged.length, 0);
   assert.ok(github.labels.some((entry) => entry.labels.includes("needs-human-intervention")));
 });
+
+test("Evolver logs rationale in structured intent/trade-offs/evidence/next-step format", async () => {
+  const workspace = new StubWorkspace();
+  const { evolver, github } = createEvolver({
+    plannerResponses: [
+      '{"action":"work","issueNumber":11}',
+      '{"action":"write_file","path":"src/feature.js","content":"export const feature = true;"}',
+      '{"action":"run_validation"}',
+      '{"action":"finish","summary":"implemented","rationale":"Intent: add baseline feature | Trade-offs: minimal scope | Evidence: validation ok | Next step: monitor"}'
+    ],
+    reviewerResponses: [
+      '{"decision":"approve","body":"looks good","rationale":"Intent: verify quality gate | Trade-offs: lightweight review | Evidence: tests passing | Next step: merge"}'
+    ],
+    workspace
+  });
+
+  await evolver.run();
+
+  const issueLog = github.comments.find((entry) => /🧾 Attempt result: implemented/.test(entry.message));
+  assert.ok(issueLog);
+  assert.match(issueLog.message, /Intent:/);
+  assert.match(issueLog.message, /Trade-offs:/);
+  assert.match(issueLog.message, /Evidence:/);
+  assert.match(issueLog.message, /Next step:/);
+
+  const reviewLog = github.comments.find((entry) => /🔍 Review round 1\/2: approve/.test(entry.message));
+  assert.ok(reviewLog);
+  assert.match(reviewLog.message, /Intent:/);
+  assert.match(reviewLog.message, /Trade-offs:/);
+  assert.match(reviewLog.message, /Evidence:/);
+  assert.match(reviewLog.message, /Next step:/);
+});
