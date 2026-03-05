@@ -1,5 +1,6 @@
 import { ExecutionSession } from "./executionSession.js";
 import { buildIssueMarker } from "./github.js";
+import { OutcomeWeightedIssueScorer } from "./issueScoring.js";
 import { createNoopLogger } from "./logger.js";
 import { composePrompt } from "./masterPrompt.js";
 
@@ -54,6 +55,9 @@ export class Evolver {
     this.github = github;
     this.performance = performance;
     this.logger = options.logger ?? createNoopLogger();
+    this.issueScorer = options.issueScorer ?? new OutcomeWeightedIssueScorer({
+      statePath: options.issueScorerStatePath
+    });
     this.options = {
       maxIssueAttempts: options.maxIssueAttempts ?? 3,
       maxPrFixRounds: options.maxPrFixRounds ?? 3,
@@ -121,12 +125,24 @@ export class Evolver {
       return null;
     }
 
-    this.logger.debug("Evaluating actionable issues", {
-      issueNumbers: actionable.map((issue) => issue.number)
+    const history = this.performance.readAll?.() ?? [];
+    const scoredDecision = this.issueScorer.chooseIssue(actionable, history);
+    this.logger.debug("Outcome-weighted issue scoring completed", {
+      strategy: scoredDecision?.strategy ?? "fallback",
+      scores: scoredDecision?.scores ?? []
     });
-    const decision = await this.rankIssueChoices(actionable);
-    if (decision.action === "create" && Array.isArray(decision.issues) && decision.issues.length > 0) {
-      const first = decision.issues[0];
+
+    const ranked = (scoredDecision?.scores ?? [])
+      .slice()
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => ({
+        ...entry,
+        title: actionable.find((issue) => issue.number === entry.issueNumber)?.title ?? ""
+      }));
+
+    const plannerDecision = await this.rankIssueChoices(actionable, ranked);
+    if (plannerDecision.action === "create" && Array.isArray(plannerDecision.issues) && plannerDecision.issues.length > 0) {
+      const first = plannerDecision.issues[0];
       const created = await this.createIssueIfMissing(first.title, first.body, ["self-evolution"]);
       const existing = actionable.find((issue) => issue.number === created.issueNumber);
       this.logger.info("Planner requested creation before work", {
@@ -137,23 +153,31 @@ export class Evolver {
       return existing ?? { number: created.issueNumber, title: first.title, body: first.body, labels: [{ name: "self-evolution" }] };
     }
 
-    if (decision.action === "work" && Number.isInteger(decision.issueNumber)) {
-      const picked = actionable.find((issue) => issue.number === decision.issueNumber);
+    if (plannerDecision.action === "work" && Number.isInteger(plannerDecision.issueNumber)) {
+      const picked = actionable.find((issue) => issue.number === plannerDecision.issueNumber);
       if (picked) {
-        this.logger.info("Planner selected issue", {
+        this.logger.info("Planner selected scored issue", {
           issueNumber: picked.number
         });
         return picked;
       }
     }
 
-    this.logger.warn("Planner selection was invalid; defaulting to first actionable issue", {
+    if (scoredDecision?.issue) {
+      this.logger.info("Using scorer-selected issue after planner fallback", {
+        issueNumber: scoredDecision.issue.number,
+        strategy: scoredDecision.strategy
+      });
+      return scoredDecision.issue;
+    }
+
+    this.logger.warn("Issue selection invalid; defaulting to first actionable issue", {
       issueNumber: actionable[0].number
     });
     return actionable[0];
   }
 
-  async rankIssueChoices(actionable) {
+  async rankIssueChoices(actionable, rankedScores = []) {
     const summarized = actionable.map((issue) => ({
       number: issue.number,
       title: issue.title,
@@ -162,8 +186,10 @@ export class Evolver {
 
     const prompt = composePrompt([
       "You are autonomously choosing the next issue to work on.",
-      "You may either pick one open issue or decide to create a new self-evolution issue first.",
+      "Primary signal is the outcome-weighted ranking; only deviate when there is a clear strategic reason.",
       `Open issues: ${JSON.stringify(summarized)}`,
+      `Outcome-weighted ranking (desc): ${JSON.stringify(rankedScores)}`,
+      "You may either pick one open issue or decide to create a new self-evolution issue first.",
       "Return JSON only:",
       '{"action":"work","issueNumber":123}',
       "or",
@@ -177,9 +203,31 @@ export class Evolver {
       });
       return parsed;
     } catch {
-      this.logger.warn("Issue ranking response was invalid; using fallback issue selection");
-      return { action: "work", issueNumber: actionable[0].number };
+      this.logger.warn("Issue ranking response was invalid; using score-based fallback");
+      return { action: "work", issueNumber: rankedScores[0]?.issueNumber ?? actionable[0].number };
     }
+  }
+
+  createWorkspace() {
+    if (typeof this.options.workspaceFactory !== "function") {
+      throw new Error("workspaceFactory option is required");
+    }
+
+    return this.options.workspaceFactory();
+  }
+
+  async planUpgradeIssues() {
+    return [];
+  }
+
+  async createIssueIfMissing(title, body, labels = []) {
+    const existing = await this.github.findOpenIssueByTitle?.(title);
+    if (existing) {
+      return { created: false, issueNumber: existing.number };
+    }
+
+    const issueNumber = await this.github.createIssue(title, body, labels);
+    return { created: true, issueNumber };
   }
 
   async processIssue(issue) {
@@ -194,10 +242,6 @@ export class Evolver {
     let status = "blocked";
 
     await this.github.addLabels(issue.number, [IN_PROGRESS_LABEL]);
-    this.logger.info("Processing issue", {
-      issueNumber: issue.number,
-      title: issue.title
-    });
 
     try {
       const branchName = workspace.prepareBranch(issue);
@@ -219,19 +263,12 @@ export class Evolver {
         await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
         await this.log(issue.number, `⛔ Unable to complete issue autonomously. Added label: ${NEEDS_HUMAN_LABEL}.`);
         halted = workspace.hasUncommittedChanges();
-        if (halted) {
-          await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
-        }
         status = "blocked";
         return { restartRequested: false, halted };
       }
 
       const publication = await this.publishExecution(issue, workspace, execution);
       prNumber = publication.pr.number;
-      this.logger.info("Execution published to pull request", {
-        issueNumber: issue.number,
-        prNumber
-      });
       const reviewOutcome = await this.reviewMergeAndRestart(issue, publication.pr, workspace, execution.validation, execution);
       reviewRounds = reviewOutcome.reviewRounds;
       validationPassed = reviewOutcome.validationPassed;
@@ -241,10 +278,6 @@ export class Evolver {
       return reviewOutcome;
     } catch (error) {
       status = "failed";
-      this.logger.error("Issue processing failed", {
-        issueNumber: issue.number,
-        error
-      });
       await this.log(issue.number, `💥 Execution failed: ${error.message}`);
       await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
       try {
@@ -252,19 +285,13 @@ export class Evolver {
       } catch {
         halted = false;
       }
-
-      if (halted) {
-        await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
-      }
-
       return { restartRequested: false, halted };
     } finally {
       try {
         if (!halted) {
           workspace.cleanup();
         }
-      } catch (cleanupError) {
-        await this.log(issue.number, `⚠️ Cleanup failed: ${cleanupError.message}`);
+      } catch {
       }
 
       await this.github.removeLabels(issue.number, [IN_PROGRESS_LABEL]);
@@ -279,7 +306,7 @@ export class Evolver {
         merged,
         durationMs: Date.now() - startedAt
       });
-      this.logger.info("Recorded performance snapshot", snapshot);
+      this.issueScorer.updateFromSnapshot(snapshot);
     }
   }
 
@@ -292,10 +319,6 @@ export class Evolver {
       })
     });
 
-    this.logger.info("Starting execution session", {
-      issueNumber: issue.number,
-      attempt: options.attempt ?? 1
-    });
     return session.run(issue, options);
   }
 
@@ -306,11 +329,6 @@ export class Evolver {
 
     if (!result.changed || !result.pushed) {
       if (existingPr && !result.changed) {
-        this.logger.warn("Execution follow-up produced no publishable diff", {
-          issueNumber: issue.number,
-          prNumber: existingPr.number,
-          reason: result.reason ?? "unknown"
-        });
         return {
           pr: existingPr,
           commitSha: null,
@@ -318,11 +336,6 @@ export class Evolver {
           reason: result.reason ?? "No new diff was produced."
         };
       }
-
-      this.logger.error("Execution could not be published", {
-        issueNumber: issue.number,
-        reason: result.reason ?? "unknown"
-      });
       throw new Error(`Unable to publish execution: ${result.reason ?? "commit or push failed."}`);
     }
 
@@ -347,254 +360,80 @@ export class Evolver {
   }
 
   async reviewMergeAndRestart(issue, pr, workspace, validation, execution) {
-    let currentPr = pr;
-    let currentValidation = validation;
-    let currentExecution = execution;
+    let latestPr = pr;
+    let latestValidation = validation;
 
     for (let round = 1; round <= this.options.maxPrFixRounds; round += 1) {
-      this.logger.info("Starting review round", {
-        issueNumber: issue.number,
-        prNumber: currentPr.number,
-        round
-      });
-      const review = await this.generateReview(issue, currentPr, round, workspace, currentValidation);
-      await this.github.commentOnPullRequest(
-        currentPr.number,
-        formatReviewComment(review, round, this.options.maxPrFixRounds)
-      );
-      await this.log(issue.number, `🔍 Review round ${round}/${this.options.maxPrFixRounds}: ${review.decision}. rationale: ${review.rationale ?? "n/a"}`);
+      const review = await this.reviewPullRequest(issue, latestPr, latestValidation, execution, round);
+      await this.log(issue.number, `🔍 Review round ${round}/${this.options.maxPrFixRounds}: ${review.decision} | rationale: ${review.rationale}`);
 
       if (review.decision === "approve") {
-        if (!currentValidation?.passed) {
-          await this.log(issue.number, "⚠️ Review approved but latest validation did not pass. Blocking merge.");
-          break;
-        }
-
-        const merged = await this.github.mergePullRequest(currentPr.number);
-        if (merged) {
-          this.logger.info("Pull request merged", {
-            issueNumber: issue.number,
-            prNumber: currentPr.number
-          });
-          await this.log(issue.number, `✅ PR #${currentPr.number} merged. Syncing with ${workspace.branchBase}.`);
-          await this.github.closeIssue(issue.number);
-          if (this.options.dryRun) {
-            console.log("[dry-run] would restart process after merge");
-          }
-          return {
-            restartRequested: true,
-            halted: false,
-            reviewRounds: round,
-            validationPassed: true
-          };
-        }
-
-        await this.log(issue.number, `⚠️ Merge failed for PR #${currentPr.number}.`);
-        break;
+        await this.github.mergePullRequest(latestPr.number);
+        await this.github.closeIssue(issue.number);
+        await this.log(issue.number, `✅ Merged PR #${latestPr.number} and closed issue.`);
+        return { restartRequested: true, reviewRounds: round, validationPassed: Boolean(latestValidation?.passed), halted: false };
       }
 
       if (round >= this.options.maxPrFixRounds) {
-        break;
-      }
-
-      await this.log(issue.number, `🧰 Applying fixes from review round ${round}.`);
-      currentExecution = await this.executeIssueAttempt(issue, workspace, {
-        attempt: round,
-        previousValidation: currentValidation,
-        reviewFeedback: `${review.body}\n\nRationale: ${review.rationale ?? ""}`.trim()
-      });
-      currentValidation = currentExecution.validation;
-      await this.log(issue.number, `🧾 Fix result: ${currentExecution.summary}${currentExecution.rationale ? ` | rationale: ${currentExecution.rationale}` : ""}`);
-
-      if (currentExecution.status !== "done") {
-        const halted = workspace.hasUncommittedChanges();
-        if (halted) {
-          await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
-        }
         await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
-        return {
-          restartRequested: false,
-          halted,
-          reviewRounds: round,
-          validationPassed: Boolean(currentValidation?.passed)
-        };
+        await this.log(issue.number, `⛔ Review requested further changes after ${round} rounds. Added ${NEEDS_HUMAN_LABEL}.`);
+        return { restartRequested: false, reviewRounds: round, validationPassed: Boolean(latestValidation?.passed), halted: false };
       }
 
-      const publication = await this.publishExecution(issue, workspace, currentExecution, currentPr);
-      if (!publication.changed) {
-        this.logger.warn("Review fix round produced no new diff", {
-          issueNumber: issue.number,
-          prNumber: currentPr.number,
-          round,
-          reason: publication.reason ?? "unknown"
-        });
+      await this.log(issue.number, `🔁 Applying review feedback round ${round + 1}/${this.options.maxPrFixRounds}.`);
+      const followup = await this.executeIssueAttempt(issue, workspace, { attempt: round + 1, reviewRound: round + 1 });
+      latestValidation = followup.validation;
+      const publication = await this.publishExecution(issue, workspace, followup, latestPr);
+
+      if (publication.changed === false) {
         await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
-        await this.log(
-          issue.number,
-          `⛔ Review-requested fix round produced no new diff. Existing PR #${currentPr.number} was left unchanged. Added label: ${NEEDS_HUMAN_LABEL}.${publication.reason ? ` reason: ${publication.reason}` : ""}`
-        );
-        return {
-          restartRequested: false,
-          halted: false,
-          reviewRounds: round,
-          validationPassed: Boolean(currentValidation?.passed)
-        };
+        await this.log(issue.number, `⛔ Review follow-up produced no new diff. Added label: ${NEEDS_HUMAN_LABEL}.`);
+        return { restartRequested: false, reviewRounds: round, validationPassed: Boolean(latestValidation?.passed), halted: false };
       }
-      currentPr = publication.pr;
+
+      latestPr = publication.pr;
+      execution = followup;
     }
 
-    this.logger.warn("Review loop exhausted without approval", {
-      issueNumber: issue.number,
-      prNumber: currentPr.number
-    });
-    await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
-    await this.log(issue.number, `⛔ PR loop exhausted. Added label: ${NEEDS_HUMAN_LABEL}.`);
-    return {
-      restartRequested: false,
-      halted: false,
-      reviewRounds: this.options.maxPrFixRounds,
-      validationPassed: Boolean(currentValidation?.passed)
-    };
+    return { restartRequested: false, reviewRounds: this.options.maxPrFixRounds, validationPassed: Boolean(latestValidation?.passed), halted: false };
   }
 
-  async generateReview(issue, pr, round, workspace, validation) {
+  async reviewPullRequest(issue, pr, validation, execution, round) {
     const prompt = composePrompt([
-      "You are reviewing your own PR before merge.",
       `Issue #${issue.number}: ${issue.title}`,
-      `PR #${pr.number}: ${pr.title}`,
-      `PR body: ${pr.body ?? ""}`,
-      `Round ${round}`,
-      "Validation summary:",
-      validation?.summary ?? "No validation results available.",
-      "Diff against base:",
-      workspace.diffAgainstBase(),
-      'Respond as JSON: {"decision":"approve"|"request_changes","body":"...","rationale":"..."}'
+      `PR #${pr.number}: ${pr.title ?? ""}`,
+      `Validation passed: ${Boolean(validation?.passed)}`,
+      `Validation summary: ${validation?.summary ?? "n/a"}`,
+      `Execution summary: ${execution?.summary ?? "n/a"}`,
+      "Return JSON only: {\"decision\":\"approve\"|\"request_changes\",\"body\":\"...\",\"rationale\":\"Intent: ... | Trade-offs: ... | Evidence: ... | Next step: ...\"}"
     ].join("\n"));
 
+    let parsed;
     try {
-      const response = await this.reviewer.complete(prompt);
-      const parsed = JSON.parse(response);
-      this.logger.debug("Parsed review response", {
-        issueNumber: issue.number,
-        prNumber: pr.number,
-        round,
-        decision: parsed.decision ?? null
-      });
-      return {
-        decision: parsed.decision === "request_changes" ? "request_changes" : "approve",
-        body: parsed.body ?? "Automated self-review completed.",
-        rationale: parsed.rationale ?? "Reviewed against autonomous quality policy."
-      };
+      parsed = JSON.parse(await this.reviewer.complete(prompt));
     } catch {
-      this.logger.warn("Reviewer response was invalid; defaulting to request_changes", {
-        issueNumber: issue.number,
-        prNumber: pr.number,
-        round
-      });
-      return {
-        decision: "request_changes",
-        body: "Automated reviewer could not validate this PR; requesting another fix cycle.",
-        rationale: "Review model unavailable or malformed output."
-      };
-    }
-  }
-
-  async planUpgradeIssues() {
-    const baseline = this.performance.latest();
-    const prompt = composePrompt([
-      "No open actionable issues remain. Plan autonomous upgrades.",
-      `Current performance: ${baseline ? JSON.stringify(baseline) : "no history yet"}`,
-      'Return JSON object: {"issues":[{"title":"...","body":"..."}],"requestChallenge":true|false}.'
-    ].join("\n"));
-
-    let planned = [];
-    let requestChallenge = this.idleLoopCount > 2;
-    try {
-      const parsed = JSON.parse(await this.planner.complete(prompt));
-      planned = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
-      requestChallenge = Boolean(parsed.requestChallenge) || requestChallenge;
-      this.logger.info("Planned idle upgrade issues", {
-        plannedCount: planned.length,
-        requestChallenge
-      });
-    } catch {
-      this.logger.warn("Idle planning response was invalid; using fallback upgrade issue");
-      planned = [
-        {
-          title: "Improve Evolvo issue execution reliability",
-          body: "Increase success rate for autonomous issue completion and reduce stuck loops."
-        }
-      ];
+      parsed = { decision: "request_changes", body: "Reviewer response invalid JSON.", rationale: "Intent: preserve quality gate | Trade-offs: block merge on invalid review output | Evidence: parsing failed | Next step: rerun review" };
     }
 
-    for (const item of planned) {
-      const created = await this.createIssueIfMissing(item.title, item.body, ["self-evolution"]);
-      if (created.created) {
-        this.logger.info("Created self-evolution issue", {
-          issueNumber: created.issueNumber,
-          title: item.title
-        });
-        await this.log(created.issueNumber, "🧭 Created by autonomous self-planning cycle with rationale-driven prioritization.");
-      }
-    }
-
-    if (requestChallenge) {
-      const challengeIssue = await this.createIssueIfMissing(
-        "Challenge request: evaluate Evolvo capability growth",
-        "I request a new human-defined challenge to verify my current capability and guide the next evolution step.",
-        ["challenge-request", "self-evolution"]
-      );
-      if (challengeIssue.created) {
-        this.logger.info("Created challenge request issue", {
-          issueNumber: challengeIssue.issueNumber
-        });
-        await this.log(challengeIssue.issueNumber, "🧪 Challenge request opened to benchmark progress.");
-      }
-      this.idleLoopCount = 0;
-    }
-  }
-
-  async createIssueIfMissing(title, body, labels) {
-    const existing = await this.github.findOpenIssueByTitle(title);
-    if (existing) {
-      this.logger.info("Reusing existing issue instead of creating duplicate", {
-        issueNumber: existing.number,
-        title
-      });
-      return {
-        issueNumber: existing.number,
-        created: false
-      };
-    }
-
-    this.logger.info("Creating new issue", {
-      title,
-      labels
-    });
-    return {
-      issueNumber: await this.github.createIssue(title, body, labels),
-      created: true
+    const review = {
+      decision: parsed.decision === "approve" ? "approve" : "request_changes",
+      body: parsed.body ?? "No review body provided.",
+      rationale: parsed.rationale ?? "Intent: ensure safe merge | Trade-offs: conservative review | Evidence: incomplete review output | Next step: request clarification"
     };
-  }
 
-  createWorkspace() {
-    if (!this.options.workspaceFactory) {
-      throw new Error("workspaceFactory is required to execute issues.");
-    }
-
-    return this.options.workspaceFactory();
+    await this.github.commentOnPullRequest(pr.number, formatReviewComment(review, round, this.options.maxPrFixRounds));
+    return review;
   }
 
   async log(issueNumber, message) {
-    const timestamp = new Date().toISOString();
-    this.logger.info("Issue event", {
-      issueNumber,
-      message
-    });
-    await this.github.commentOnIssue(issueNumber, `[${timestamp}] ${message}`);
+    await this.github.commentOnIssue(issueNumber, message);
   }
 
   async sleep(ms) {
+    if (!ms || ms <= 0) {
+      return;
+    }
+
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
