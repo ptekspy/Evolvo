@@ -122,3 +122,43 @@ test("FallbackProvider escalates on no-progress ceiling", async () => {
   const result = await provider.complete("hello");
   assert.equal(result, "ok");
 });
+
+test("FallbackProvider escalates when maxTotalRetryAttempts is reached", async () => {
+  const primary = { complete: async () => { throw new Error("flaky upstream"); } };
+  const fallback = { complete: async () => "ok" };
+  const provider = new FallbackProvider(primary, fallback, undefined, {
+    escalationPolicy: {
+      maxConsecutivePrimaryFailures: 99,
+      maxConsecutiveTimeouts: 99,
+      maxConsecutiveMalformedOutputs: 99,
+      maxConsecutiveIdenticalErrors: 99,
+      maxNoProgressEvents: 99,
+      maxTotalRetryAttempts: 2
+    }
+  });
+
+  await assert.rejects(() => provider.complete("hello"), /flaky upstream/);
+  const result = await provider.complete("hello");
+  assert.equal(result, "ok");
+});
+
+test("FallbackProvider preserves primary attempt telemetry when fallback throws", async () => {
+  const primary = { complete: async () => { throw new Error("request timeout"); } };
+  const fallback = { complete: async () => { throw new Error("fallback down"); } };
+  const provider = new FallbackProvider(primary, fallback, undefined, {
+    escalationPolicy: {
+      maxConsecutiveTimeouts: 1,
+      maxConsecutivePrimaryFailures: 99,
+      maxConsecutiveIdenticalErrors: 99,
+      maxConsecutiveMalformedOutputs: 99,
+      maxNoProgressEvents: 99,
+      maxTotalRetryAttempts: 99
+    }
+  });
+
+  await assert.rejects(() => provider.complete("hello"), /fallback down/);
+  assert.equal(provider.attemptTelemetry.length, 1);
+  assert.equal(provider.attemptTelemetry[0].provider, "primary");
+  assert.equal(provider.attemptTelemetry[0].ok, false);
+  assert.equal(provider.attemptTelemetry[0].errorClass, "timeout");
+});
