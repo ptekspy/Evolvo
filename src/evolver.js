@@ -1,7 +1,39 @@
-import { execSync } from "node:child_process";
+import { ExecutionSession } from "./executionSession.js";
+import { buildIssueMarker } from "./github.js";
 import { composePrompt } from "./masterPrompt.js";
 
+const IN_PROGRESS_LABEL = "in-progress";
 const NEEDS_HUMAN_LABEL = "needs-human-intervention";
+
+function ensureIssueMarker(body, issueNumber) {
+  const marker = buildIssueMarker(issueNumber);
+  if ((body ?? "").includes(marker)) {
+    return body;
+  }
+
+  return [body?.trim(), "", marker].filter(Boolean).join("\n");
+}
+
+function buildPullRequestBody(issue, execution) {
+  const sections = [];
+  if (execution.prBody?.trim()) {
+    sections.push(execution.prBody.trim());
+  } else {
+    sections.push(execution.summary);
+    if (execution.rationale) {
+      sections.push(`Rationale: ${execution.rationale}`);
+    }
+  }
+
+  if (execution.validation?.summary) {
+    sections.push("Validation");
+    sections.push("```text");
+    sections.push(execution.validation.summary);
+    sections.push("```");
+  }
+
+  return ensureIssueMarker(sections.join("\n\n"), issue.number);
+}
 
 export class Evolver {
   constructor(planner, reviewer, github, performance, options = {}) {
@@ -12,9 +44,11 @@ export class Evolver {
     this.options = {
       maxIssueAttempts: options.maxIssueAttempts ?? 3,
       maxPrFixRounds: options.maxPrFixRounds ?? 3,
+      maxAgentSteps: options.maxAgentSteps ?? 40,
       dryRun: options.dryRun ?? true,
       loopDelayMs: options.loopDelayMs ?? 2000,
-      maxLoops: options.maxLoops ?? Number.POSITIVE_INFINITY
+      maxLoops: options.maxLoops ?? Number.POSITIVE_INFINITY,
+      workspaceFactory: options.workspaceFactory
     };
     this.idleLoopCount = 0;
   }
@@ -36,9 +70,14 @@ export class Evolver {
 
       this.idleLoopCount = 0;
       await this.log(issue.number, `🚀 Starting autonomous work on issue #${issue.number}: ${issue.title}`);
-      const finished = await this.processIssue(issue);
-      if (finished.restartRequested) {
+      const outcome = await this.processIssue(issue);
+
+      if (outcome.restartRequested) {
         return { restartRequested: true };
+      }
+
+      if (outcome.halted) {
+        return { restartRequested: false, halted: true };
       }
 
       await this.sleep(this.options.loopDelayMs);
@@ -61,8 +100,9 @@ export class Evolver {
     const decision = await this.rankIssueChoices(actionable);
     if (decision.action === "create" && Array.isArray(decision.issues) && decision.issues.length > 0) {
       const first = decision.issues[0];
-      const issueNumber = await this.github.createIssue(first.title, first.body, ["self-evolution"]);
-      return { number: issueNumber, title: first.title, body: first.body, labels: [{ name: "self-evolution" }] };
+      const created = await this.createIssueIfMissing(first.title, first.body, ["self-evolution"]);
+      const existing = actionable.find((issue) => issue.number === created.issueNumber);
+      return existing ?? { number: created.issueNumber, title: first.title, body: first.body, labels: [{ name: "self-evolution" }] };
     }
 
     if (decision.action === "work" && Number.isInteger(decision.issueNumber)) {
@@ -72,7 +112,7 @@ export class Evolver {
       }
     }
 
-    return actionable[Math.floor(Math.random() * actionable.length)];
+    return actionable[0];
   }
 
   async rankIssueChoices(actionable) {
@@ -100,85 +140,218 @@ export class Evolver {
   }
 
   async processIssue(issue) {
-    let execution = { status: "stuck", summary: "No attempts executed.", rationale: "" };
-    for (let attempt = 1; attempt <= this.options.maxIssueAttempts; attempt += 1) {
-      await this.log(issue.number, `🛠️ Attempt ${attempt}/${this.options.maxIssueAttempts} to implement issue.`);
-      execution = await this.executeIssueAttempt(issue, attempt);
-      await this.log(issue.number, `🧾 Attempt result: ${execution.summary}${execution.rationale ? ` | rationale: ${execution.rationale}` : ""}`);
-      if (execution.status === "done") {
-        break;
-      }
-    }
+    const startedAt = Date.now();
+    const workspace = this.createWorkspace();
+    let attempts = 0;
+    let reviewRounds = 0;
+    let prNumber = null;
+    let validationPassed = false;
+    let merged = false;
+    let halted = false;
+    let status = "blocked";
 
-    if (execution.status !== "done") {
-      await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
-      await this.log(issue.number, `⛔ Unable to complete issue autonomously. Added label: ${NEEDS_HUMAN_LABEL}.`);
-      return { restartRequested: false };
-    }
-
-    return this.reviewMergeAndRestart(issue);
-  }
-
-  async executeIssueAttempt(issue, attempt) {
-    const prompt = composePrompt([
-      "You are implementing the GitHub issue below in a TypeScript engineering repo.",
-      `Issue #${issue.number}: ${issue.title}`,
-      `Issue body: ${issue.body ?? ""}`,
-      `Attempt ${attempt}`,
-      "Return JSON with status(done|stuck), summary, rationale, nextStep."
-    ].join("\n"));
+    await this.github.addLabels(issue.number, [IN_PROGRESS_LABEL]);
 
     try {
-      const response = await this.planner.complete(prompt);
-      const parsed = JSON.parse(response);
-      if (parsed.status === "done") {
-        return { status: "done", summary: parsed.summary ?? "Implementation finished.", rationale: parsed.rationale ?? "" };
+      const branchName = workspace.prepareBranch(issue);
+      await this.log(issue.number, `🌿 Prepared branch ${branchName}.`);
+
+      let execution = null;
+      for (let attempt = 1; attempt <= this.options.maxIssueAttempts; attempt += 1) {
+        attempts = attempt;
+        await this.log(issue.number, `🛠️ Attempt ${attempt}/${this.options.maxIssueAttempts} to implement issue.`);
+        execution = await this.executeIssueAttempt(issue, workspace, { attempt });
+        validationPassed = Boolean(execution.validation?.passed);
+        await this.log(issue.number, `🧾 Attempt result: ${execution.summary}${execution.rationale ? ` | rationale: ${execution.rationale}` : ""}`);
+        if (execution.status === "done") {
+          break;
+        }
       }
-      return { status: "stuck", summary: parsed.summary ?? "Implementation stalled.", rationale: parsed.rationale ?? parsed.nextStep ?? "" };
+
+      if (!execution || execution.status !== "done") {
+        await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
+        await this.log(issue.number, `⛔ Unable to complete issue autonomously. Added label: ${NEEDS_HUMAN_LABEL}.`);
+        halted = workspace.hasUncommittedChanges();
+        if (halted) {
+          await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
+        }
+        status = "blocked";
+        return { restartRequested: false, halted };
+      }
+
+      const publication = await this.publishExecution(issue, workspace, execution);
+      prNumber = publication.pr.number;
+      const reviewOutcome = await this.reviewMergeAndRestart(issue, publication.pr, workspace, execution.validation, execution);
+      reviewRounds = reviewOutcome.reviewRounds;
+      validationPassed = reviewOutcome.validationPassed;
+      merged = reviewOutcome.restartRequested;
+      halted = reviewOutcome.halted ?? false;
+      status = merged ? "merged" : "blocked";
+      return reviewOutcome;
     } catch (error) {
-      return { status: "stuck", summary: `Planner execution failed: ${error}`, rationale: "Model parsing or provider failure." };
+      status = "failed";
+      await this.log(issue.number, `💥 Execution failed: ${error.message}`);
+      await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
+      try {
+        halted = workspace.hasUncommittedChanges();
+      } catch {
+        halted = false;
+      }
+
+      if (halted) {
+        await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
+      }
+
+      return { restartRequested: false, halted };
+    } finally {
+      try {
+        if (!halted) {
+          workspace.cleanup();
+        }
+      } catch (cleanupError) {
+        await this.log(issue.number, `⚠️ Cleanup failed: ${cleanupError.message}`);
+      }
+
+      await this.github.removeLabels(issue.number, [IN_PROGRESS_LABEL]);
+      this.performance.record({
+        timestamp: new Date().toISOString(),
+        issueNumber: issue.number,
+        status,
+        attempts,
+        reviewRounds,
+        validationPassed,
+        prNumber,
+        merged,
+        durationMs: Date.now() - startedAt
+      });
     }
   }
 
-  async reviewMergeAndRestart(issue) {
-    const pr = await this.github.findOpenPullRequestForIssue(issue.number);
-    if (!pr) {
-      await this.log(issue.number, "⚠️ No open PR found linked to this issue. Awaiting PR creation.");
-      return { restartRequested: false };
+  async executeIssueAttempt(issue, workspace, options = {}) {
+    const session = new ExecutionSession(this.planner, workspace, {
+      maxSteps: this.options.maxAgentSteps
+    });
+
+    return session.run(issue, options);
+  }
+
+  async publishExecution(issue, workspace, execution, existingPr = null) {
+    const prTitle = execution.prTitle?.trim() || issue.title;
+    const prBody = buildPullRequestBody(issue, execution);
+    const result = workspace.commitAndPush(issue, prTitle);
+
+    if (!result.changed || !result.pushed) {
+      throw new Error(`Unable to publish execution: ${result.reason ?? "commit or push failed."}`);
     }
 
+    let pr = existingPr ?? await this.github.findOpenPullRequestForIssue(issue.number);
+    if (pr) {
+      pr = await this.github.updatePullRequest(pr.number, {
+        title: prTitle,
+        body: prBody
+      });
+      await this.log(issue.number, `🔄 Updated PR #${pr.number} from branch ${result.branchName}.`);
+      return { pr, commitSha: result.commitSha };
+    }
+
+    pr = await this.github.createPullRequest({
+      title: prTitle,
+      body: prBody,
+      head: result.branchName,
+      base: "main"
+    });
+    await this.log(issue.number, `📬 Opened PR #${pr.number} from branch ${result.branchName}.`);
+    return { pr, commitSha: result.commitSha };
+  }
+
+  async reviewMergeAndRestart(issue, pr, workspace, validation, execution) {
+    let currentPr = pr;
+    let currentValidation = validation;
+    let currentExecution = execution;
+
     for (let round = 1; round <= this.options.maxPrFixRounds; round += 1) {
-      const review = await this.generateReview(pr, round);
-      await this.github.reviewPullRequest(pr.number, review);
+      const review = await this.generateReview(issue, currentPr, round, workspace, currentValidation);
+      await this.github.reviewPullRequest(currentPr.number, review);
       await this.log(issue.number, `🔍 Review round ${round}/${this.options.maxPrFixRounds}: ${review.decision}. rationale: ${review.rationale ?? "n/a"}`);
 
       if (review.decision === "approve") {
-        const merged = await this.github.mergePullRequest(pr.number);
-        if (merged) {
-          await this.log(issue.number, `✅ PR #${pr.number} merged. Syncing with main and restarting Evolvo.`);
-          await this.github.closeIssue(issue.number);
-          this.syncMainAndRestart();
-          return { restartRequested: true };
+        if (!currentValidation?.passed) {
+          await this.log(issue.number, "⚠️ Review approved but latest validation did not pass. Blocking merge.");
+          break;
         }
-        await this.log(issue.number, `⚠️ Merge failed for PR #${pr.number}.`);
+
+        const merged = await this.github.mergePullRequest(currentPr.number);
+        if (merged) {
+          await this.log(issue.number, `✅ PR #${currentPr.number} merged. Syncing with ${workspace.branchBase}.`);
+          await this.github.closeIssue(issue.number);
+          if (this.options.dryRun) {
+            console.log("[dry-run] would restart process after merge");
+          }
+          return {
+            restartRequested: true,
+            halted: false,
+            reviewRounds: round,
+            validationPassed: true
+          };
+        }
+
+        await this.log(issue.number, `⚠️ Merge failed for PR #${currentPr.number}.`);
+        break;
+      }
+
+      if (round >= this.options.maxPrFixRounds) {
         break;
       }
 
       await this.log(issue.number, `🧰 Applying fixes from review round ${round}.`);
+      currentExecution = await this.executeIssueAttempt(issue, workspace, {
+        attempt: round,
+        previousValidation: currentValidation,
+        reviewFeedback: `${review.body}\n\nRationale: ${review.rationale ?? ""}`.trim()
+      });
+      currentValidation = currentExecution.validation;
+      await this.log(issue.number, `🧾 Fix result: ${currentExecution.summary}${currentExecution.rationale ? ` | rationale: ${currentExecution.rationale}` : ""}`);
+
+      if (currentExecution.status !== "done") {
+        const halted = workspace.hasUncommittedChanges();
+        if (halted) {
+          await this.log(issue.number, `🧷 Preserving local branch ${workspace.getBranchName()} with uncommitted work for inspection.`);
+        }
+        await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
+        return {
+          restartRequested: false,
+          halted,
+          reviewRounds: round,
+          validationPassed: Boolean(currentValidation?.passed)
+        };
+      }
+
+      const publication = await this.publishExecution(issue, workspace, currentExecution, currentPr);
+      currentPr = publication.pr;
     }
 
     await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
     await this.log(issue.number, `⛔ PR loop exhausted. Added label: ${NEEDS_HUMAN_LABEL}.`);
-    return { restartRequested: false };
+    return {
+      restartRequested: false,
+      halted: false,
+      reviewRounds: this.options.maxPrFixRounds,
+      validationPassed: Boolean(currentValidation?.passed)
+    };
   }
 
-  async generateReview(pr, round) {
+  async generateReview(issue, pr, round, workspace, validation) {
     const prompt = composePrompt([
       "You are reviewing your own PR before merge.",
+      `Issue #${issue.number}: ${issue.title}`,
       `PR #${pr.number}: ${pr.title}`,
       `PR body: ${pr.body ?? ""}`,
       `Round ${round}`,
-      "Respond as JSON: {\"decision\":\"approve\"|\"request_changes\",\"body\":\"...\",\"rationale\":\"...\"}."
+      "Validation summary:",
+      validation?.summary ?? "No validation results available.",
+      "Diff against base:",
+      workspace.diffAgainstBase(),
+      'Respond as JSON: {"decision":"approve"|"request_changes","body":"...","rationale":"..."}'
     ].join("\n"));
 
     try {
@@ -203,7 +376,7 @@ export class Evolver {
     const prompt = composePrompt([
       "No open actionable issues remain. Plan autonomous upgrades.",
       `Current performance: ${baseline ? JSON.stringify(baseline) : "no history yet"}`,
-      "Return JSON object: {\"issues\":[{\"title\":\"...\",\"body\":\"...\"}],\"requestChallenge\":true|false}."
+      'Return JSON object: {"issues":[{"title":"...","body":"..."}],"requestChallenge":true|false}.'
     ].join("\n"));
 
     let planned = [];
@@ -222,29 +395,46 @@ export class Evolver {
     }
 
     for (const item of planned) {
-      const issueNumber = await this.github.createIssue(item.title, item.body, ["self-evolution"]);
-      await this.log(issueNumber, "🧭 Created by autonomous self-planning cycle with rationale-driven prioritization.");
+      const created = await this.createIssueIfMissing(item.title, item.body, ["self-evolution"]);
+      if (created.created) {
+        await this.log(created.issueNumber, "🧭 Created by autonomous self-planning cycle with rationale-driven prioritization.");
+      }
     }
 
     if (requestChallenge) {
-      const challengeIssue = await this.github.createIssue(
+      const challengeIssue = await this.createIssueIfMissing(
         "Challenge request: evaluate Evolvo capability growth",
         "I request a new human-defined challenge to verify my current capability and guide the next evolution step.",
         ["challenge-request", "self-evolution"]
       );
-      await this.log(challengeIssue, "🧪 Challenge request opened to benchmark progress.");
+      if (challengeIssue.created) {
+        await this.log(challengeIssue.issueNumber, "🧪 Challenge request opened to benchmark progress.");
+      }
       this.idleLoopCount = 0;
     }
   }
 
-  syncMainAndRestart() {
-    if (this.options.dryRun) {
-      console.log("[dry-run] would run: git pull --rebase origin main && restart process");
-      return;
+  async createIssueIfMissing(title, body, labels) {
+    const existing = await this.github.findOpenIssueByTitle(title);
+    if (existing) {
+      return {
+        issueNumber: existing.number,
+        created: false
+      };
     }
 
-    execSync("git pull --rebase origin main", { stdio: "inherit" });
-    process.exit(75);
+    return {
+      issueNumber: await this.github.createIssue(title, body, labels),
+      created: true
+    };
+  }
+
+  createWorkspace() {
+    if (!this.options.workspaceFactory) {
+      throw new Error("workspaceFactory is required to execute issues.");
+    }
+
+    return this.options.workspaceFactory();
   }
 
   async log(issueNumber, message) {

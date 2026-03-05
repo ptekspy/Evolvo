@@ -1,9 +1,21 @@
+const ISSUE_MARKER_PREFIX = "Closes #";
+
+function markerForIssue(issueNumber) {
+  return `${ISSUE_MARKER_PREFIX}${issueNumber}`;
+}
+
+function parseDryRunPullRequestNumber(nextValue) {
+  return nextValue - 1;
+}
+
 export class GitHubClient {
   constructor(options) {
     this.options = options;
     this.baseUrl = `https://api.github.com/repos/${options.owner}/${options.repo}`;
     this.nextDryRunIssue = -1;
+    this.nextDryRunPr = -1000;
     this.dryRunIssues = [];
+    this.dryRunPullRequests = [];
   }
 
   async ensurePromptIssue() {
@@ -33,6 +45,11 @@ export class GitHubClient {
 
     const issues = await this.request("/issues?state=open&sort=created&direction=asc", { method: "GET" });
     return issues.filter((issue) => !issue.pull_request);
+  }
+
+  async findOpenIssueByTitle(title) {
+    const issues = await this.listOpenIssues();
+    return issues.find((issue) => issue.title === title);
   }
 
   async createIssue(title, body, labels = []) {
@@ -73,6 +90,23 @@ export class GitHubClient {
     });
   }
 
+  async removeLabels(issueNumber, labels) {
+    if (this.options.dryRun) {
+      const issue = this.dryRunIssues.find((item) => item.number === issueNumber);
+      if (issue) {
+        issue.labels = (issue.labels ?? []).filter((label) => !labels.includes(typeof label === "string" ? label : label.name));
+      }
+      console.log(`[dry-run] remove labels from issue #${issueNumber}: ${labels.join(",")}`);
+      return;
+    }
+
+    for (const label of labels) {
+      await this.request(`/issues/${issueNumber}/labels/${encodeURIComponent(label)}`, {
+        method: "DELETE"
+      });
+    }
+  }
+
   async closeIssue(issueNumber) {
     if (this.options.dryRun) {
       this.dryRunIssues = this.dryRunIssues.filter((item) => item.number !== issueNumber);
@@ -100,18 +134,66 @@ export class GitHubClient {
 
   async listOpenPullRequests() {
     if (this.options.dryRun) {
-      return [];
+      return this.dryRunPullRequests.filter((pullRequest) => pullRequest.state === "open");
     }
 
     return this.request("/pulls?state=open", { method: "GET" });
   }
 
-  async findOpenPullRequestForIssue(issueNumber) {
-    const prs = await this.listOpenPullRequests();
-    return prs.find((pr) => {
-      const text = `${pr.title ?? ""}\n${pr.body ?? ""}`;
-      return text.includes(`#${issueNumber}`);
+  async getPullRequest(prNumber) {
+    if (this.options.dryRun) {
+      return this.dryRunPullRequests.find((pullRequest) => pullRequest.number === prNumber);
+    }
+
+    return this.request(`/pulls/${prNumber}`, { method: "GET" });
+  }
+
+  async createPullRequest({ title, body, head, base = "main" }) {
+    if (this.options.dryRun) {
+      const number = this.nextDryRunPr;
+      this.nextDryRunPr = parseDryRunPullRequestNumber(number);
+      const pullRequest = {
+        number,
+        title,
+        body,
+        state: "open",
+        head: { ref: head },
+        base: { ref: base }
+      };
+      this.dryRunPullRequests.push(pullRequest);
+      console.log(`[dry-run] create PR #${number}: ${title}`);
+      return pullRequest;
+    }
+
+    return this.request("/pulls", {
+      method: "POST",
+      body: { title, body, head, base }
     });
+  }
+
+  async updatePullRequest(prNumber, { title, body }) {
+    if (this.options.dryRun) {
+      const pullRequest = this.dryRunPullRequests.find((item) => item.number === prNumber);
+      if (!pullRequest) {
+        throw new Error(`Unknown dry-run PR #${prNumber}`);
+      }
+
+      pullRequest.title = title ?? pullRequest.title;
+      pullRequest.body = body ?? pullRequest.body;
+      console.log(`[dry-run] update PR #${prNumber}`);
+      return pullRequest;
+    }
+
+    return this.request(`/pulls/${prNumber}`, {
+      method: "PATCH",
+      body: { title, body }
+    });
+  }
+
+  async findOpenPullRequestForIssue(issueNumber) {
+    const pullRequests = await this.listOpenPullRequests();
+    const marker = markerForIssue(issueNumber);
+    return pullRequests.find((pullRequest) => (pullRequest.body ?? "").includes(marker));
   }
 
   async reviewPullRequest(prNumber, review) {
@@ -131,6 +213,11 @@ export class GitHubClient {
 
   async mergePullRequest(prNumber) {
     if (this.options.dryRun) {
+      const pullRequest = this.dryRunPullRequests.find((item) => item.number === prNumber);
+      if (pullRequest) {
+        pullRequest.state = "closed";
+        pullRequest.merged = true;
+      }
       console.log(`[dry-run] merge PR #${prNumber}`);
       return true;
     }
@@ -158,6 +245,15 @@ export class GitHubClient {
       throw new Error(`GitHub API failed (${response.status}): ${await response.text()}`);
     }
 
-    return await response.json();
+    if (response.status === 204) {
+      return null;
+    }
+
+    const text = await response.text();
+    return text ? JSON.parse(text) : null;
   }
+}
+
+export function buildIssueMarker(issueNumber) {
+  return markerForIssue(issueNumber);
 }

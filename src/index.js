@@ -5,8 +5,10 @@ import { PerformanceTracker } from "./performance.js";
 import { FallbackProvider } from "./providers/fallback.js";
 import { OllamaProvider } from "./providers/ollama.js";
 import { OpenAiProvider } from "./providers/openai.js";
+import { Workspace } from "./workspace.js";
 
 async function main() {
+  process.loadEnvFile?.(".env");
   const config = readConfig();
 
   const ollama = new OllamaProvider(config.ollamaBaseUrl, config.ollamaModel);
@@ -30,8 +32,13 @@ async function main() {
     {
       maxIssueAttempts: config.maxIssueAttempts,
       maxPrFixRounds: config.maxPrFixRounds,
+      maxAgentSteps: config.maxAgentSteps,
       loopDelayMs: config.loopDelayMs,
-      dryRun: config.dryRun
+      dryRun: config.dryRun,
+      workspaceFactory: () => new Workspace(process.cwd(), {
+        githubToken: config.githubToken,
+        commandTimeoutMs: config.commandTimeoutMs
+      })
     }
   );
 

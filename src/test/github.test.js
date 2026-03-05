@@ -9,8 +9,52 @@ test("ensurePromptIssue creates first prompt issue when no issues exist", async 
   assert.match(issue.title, /Prompt Evolvo/);
 });
 
-test("findOpenPullRequestForIssue returns undefined in dry-run", async () => {
+test("GitHubClient can create and update dry-run pull requests linked to an issue marker", async () => {
   const client = new GitHubClient({ owner: "o", repo: "r", token: "t", dryRun: true });
-  const pr = await client.findOpenPullRequestForIssue(1);
-  assert.equal(pr, undefined);
+  const pullRequest = await client.createPullRequest({
+    title: "Implement thing",
+    body: "Summary\n\nCloses #7",
+    head: "evolvo/issue-7-implement-thing",
+    base: "main"
+  });
+
+  const found = await client.findOpenPullRequestForIssue(7);
+  assert.equal(found.number, pullRequest.number);
+
+  const updated = await client.updatePullRequest(pullRequest.number, {
+    title: "Implement thing v2",
+    body: "Updated\n\nCloses #7"
+  });
+  assert.equal(updated.title, "Implement thing v2");
+});
+
+test("GitHubClient supports label removal and issue title lookup in dry-run mode", async () => {
+  const client = new GitHubClient({ owner: "o", repo: "r", token: "t", dryRun: true });
+  const issueNumber = await client.createIssue("Improve reliability", "Body", ["self-evolution", "in-progress"]);
+
+  const existing = await client.findOpenIssueByTitle("Improve reliability");
+  assert.equal(existing.number, issueNumber);
+
+  await client.removeLabels(issueNumber, ["in-progress"]);
+  const open = await client.listOpenIssues();
+  const labels = open[0].labels.map((label) => label.name);
+  assert.deepEqual(labels, ["self-evolution"]);
+});
+
+test("GitHubClient dry-run merge and close update local state", async () => {
+  const client = new GitHubClient({ owner: "o", repo: "r", token: "t", dryRun: true });
+  const issueNumber = await client.createIssue("Implement thing", "Body", []);
+  const pullRequest = await client.createPullRequest({
+    title: "Implement thing",
+    body: "Closes #1",
+    head: "branch",
+    base: "main"
+  });
+
+  const merged = await client.mergePullRequest(pullRequest.number);
+  await client.closeIssue(issueNumber);
+
+  assert.equal(merged, true);
+  assert.equal((await client.listOpenPullRequests()).length, 0);
+  assert.equal((await client.listOpenIssues()).length, 0);
 });

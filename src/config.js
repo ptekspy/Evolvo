@@ -17,6 +17,8 @@ export function readConfig() {
     openAiModel: process.env.OPENAI_MODEL ?? "gpt-5.3-codex",
     maxIssueAttempts: Number(process.env.MAX_ISSUE_ATTEMPTS ?? "3"),
     maxPrFixRounds: Number(process.env.MAX_PR_FIX_ROUNDS ?? "3"),
+    maxAgentSteps: Number(process.env.MAX_AGENT_STEPS ?? "40"),
+    commandTimeoutMs: Number(process.env.COMMAND_TIMEOUT_MS ?? "120000"),
     loopDelayMs: Number(process.env.LOOP_DELAY_MS ?? "2000"),
     dryRun: (process.env.DRY_RUN ?? "true").toLowerCase() === "true"
   };

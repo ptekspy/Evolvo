@@ -23,6 +23,7 @@ export class PerformanceTracker {
     const snapshots = this.readAll();
     snapshots.push(snapshot);
     writeFileSync(this.filePath, JSON.stringify(snapshots, null, 2));
+    return snapshot;
   }
 
   latest() {
