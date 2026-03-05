@@ -19,6 +19,7 @@ export function readConfig() {
     maxPrFixRounds: Number(process.env.MAX_PR_FIX_ROUNDS ?? "3"),
     maxAgentSteps: Number(process.env.MAX_AGENT_STEPS ?? "40"),
     commandTimeoutMs: Number(process.env.COMMAND_TIMEOUT_MS ?? "120000"),
+    logLevel: process.env.LOG_LEVEL ?? "info",
     loopDelayMs: Number(process.env.LOOP_DELAY_MS ?? "2000"),
     dryRun: (process.env.DRY_RUN ?? "true").toLowerCase() === "true"
   };

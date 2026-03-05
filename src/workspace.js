@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, matchesGlob, relative, resolve, sep } from "node:path";
+import { createNoopLogger } from "./logger.js";
 
 const DEFAULT_BRANCH = "main";
 const DEFAULT_MAX_COMMAND_OUTPUT = 12000;
@@ -60,6 +61,10 @@ function summarizeDirtyEntries(entries) {
   return entries.map((entry) => `${entry.code} ${entry.path}`).join(", ");
 }
 
+function summarizeOutput(output) {
+  return truncate(output.trim() || "<no output>", 400);
+}
+
 export function branchNameForIssue(issueNumber, title) {
   return `evolvo/issue-${issueNumber}-${slugify(title)}`;
 }
@@ -87,6 +92,7 @@ export class Workspace {
     this.githubToken = options.githubToken ?? "";
     this.commandTimeoutMs = options.commandTimeoutMs ?? 120000;
     this.branchBase = options.branchBase ?? DEFAULT_BRANCH;
+    this.logger = options.logger ?? createNoopLogger();
     this.baseRef = `origin/${this.branchBase}`;
     this.branchName = null;
     this.touchedFiles = new Set();
@@ -106,8 +112,13 @@ export class Workspace {
     const disallowed = entries.filter((entry) => !isAllowedDirtyPath(entry));
 
     if (disallowed.length > 0) {
+      this.logger.warn("Workspace is dirty before execution", {
+        disallowed: summarizeDirtyEntries(disallowed)
+      });
       throw new Error(`Workspace must be clean before execution. Disallowed changes: ${summarizeDirtyEntries(disallowed)}`);
     }
+
+    this.logger.debug("Workspace cleanliness check passed");
   }
 
   hasUncommittedChanges() {
@@ -119,6 +130,11 @@ export class Workspace {
   prepareBranch(issue) {
     this.assertCleanWorktree();
     this.branchName = branchNameForIssue(issue.number, issue.title);
+    this.logger.info("Preparing execution branch", {
+      issueNumber: issue.number,
+      branchName: this.branchName,
+      baseRef: this.baseRef
+    });
     this.runGit(["fetch", "origin", this.branchBase], { authenticated: true });
     this.runGit(["checkout", "-B", this.branchName, this.baseRef]);
     this.touchedFiles.clear();
@@ -128,6 +144,10 @@ export class Workspace {
   listFiles(glob) {
     const files = this.walkFiles("");
     const filtered = glob ? files.filter((file) => matchesGlob(file, glob)) : files;
+    this.logger.debug("Listed workspace files", {
+      glob: glob ?? null,
+      count: filtered.length
+    });
     return filtered.length > 0 ? filtered.join("\n") : "No files matched.";
   }
 
@@ -136,6 +156,9 @@ export class Workspace {
       return "Query is required.";
     }
 
+    this.logger.debug("Searching code", {
+      query
+    });
     const matches = [];
     for (const file of this.walkFiles("")) {
       const content = readFileSync(resolve(this.rootDir, file), "utf8");
@@ -158,6 +181,9 @@ export class Workspace {
       return "At least one path is required.";
     }
 
+    this.logger.debug("Reading files", {
+      paths
+    });
     const sections = [];
     for (const path of paths) {
       const { relativePath, absolutePath } = this.resolveWritablePath(path);
@@ -177,12 +203,20 @@ export class Workspace {
     mkdirSync(dirname(absolutePath), { recursive: true });
     writeFileSync(absolutePath, content);
     this.touchedFiles.add(relativePath);
+    this.logger.info("Wrote file", {
+      path: relativePath,
+      bytes: Buffer.byteLength(content, "utf8"),
+      touchedCount: this.touchedFiles.size
+    });
     return `Wrote ${relativePath} (${Buffer.byteLength(content, "utf8")} bytes).`;
   }
 
   deleteFile(path) {
     const { relativePath, absolutePath } = this.resolveWritablePath(path);
     if (!existsSync(absolutePath)) {
+      this.logger.warn("delete_file targeted missing file", {
+        path: relativePath
+      });
       return `File ${relativePath} did not exist.`;
     }
 
@@ -192,6 +226,10 @@ export class Workspace {
 
     rmSync(absolutePath);
     this.touchedFiles.add(relativePath);
+    this.logger.info("Deleted file", {
+      path: relativePath,
+      touchedCount: this.touchedFiles.size
+    });
     return `Deleted ${relativePath}.`;
   }
 
@@ -200,12 +238,18 @@ export class Workspace {
       return "No tracked file edits yet.";
     }
 
+    this.logger.debug("Showing diff for touched files", {
+      files: this.getTouchedFiles()
+    });
     const args = ["diff", "--no-ext-diff", "--", ...this.getTouchedFiles()];
     const result = this.runGit(args, { allowFailure: true });
     return result.stdout ? truncate(result.stdout) : "No diff output.";
   }
 
   diffAgainstBase() {
+    this.logger.debug("Showing diff against base", {
+      baseRef: this.baseRef
+    });
     const result = this.runGit(["diff", "--no-ext-diff", `${this.baseRef}...HEAD`], { allowFailure: true });
     return result.stdout ? truncate(result.stdout) : "No diff against base.";
   }
@@ -219,6 +263,7 @@ export class Workspace {
     ].filter(([, command]) => Boolean(command));
 
     if (steps.length === 0) {
+      this.logger.info("Validation skipped because no scripts were configured");
       return {
         passed: true,
         summary: "No validation scripts configured."
@@ -228,11 +273,20 @@ export class Workspace {
     const report = [];
     for (const [name, command] of steps) {
       const [bin, args] = command;
+      this.logger.info("Running validation step", {
+        step: name,
+        command: `${bin} ${args.join(" ")}`
+      });
       const result = this.runCommand(bin, args, { allowFailure: true });
       const combined = truncate(`${result.stdout}${result.stderr}`.trim() || "<no output>");
       report.push(`$ ${bin} ${args.join(" ")}\n${combined}`);
 
       if (result.status !== 0) {
+        this.logger.warn("Validation step failed", {
+          step: name,
+          status: result.status,
+          output: summarizeOutput(`${result.stdout}${result.stderr}`)
+        });
         return {
           passed: false,
           summary: `Validation failed during ${name}.\n\n${report.join("\n\n")}`
@@ -240,6 +294,9 @@ export class Workspace {
       }
     }
 
+    this.logger.info("Validation passed", {
+      steps: steps.map(([name]) => name)
+    });
     return {
       passed: true,
       summary: report.join("\n\n")
@@ -249,10 +306,14 @@ export class Workspace {
   stageTouchedFiles() {
     const files = this.getTouchedFiles();
     if (files.length === 0) {
+      this.logger.warn("No touched files available to stage");
       return [];
     }
 
     this.runGit(["add", "-A", "--", ...files]);
+    this.logger.info("Staged touched files", {
+      files
+    });
     return files;
   }
 
@@ -278,14 +339,27 @@ export class Workspace {
     }
 
     const commitMessage = `feat(issue #${issue.number}): ${prTitle || issue.title}`;
+    this.logger.info("Creating commit for issue branch", {
+      issueNumber: issue.number,
+      commitMessage,
+      files
+    });
     this.runGit(["commit", "-m", commitMessage]);
+    this.logger.info("Pushing issue branch", {
+      branchName: this.branchName
+    });
     this.runGit(["push", "-u", "origin", `HEAD:refs/heads/${this.branchName}`], { authenticated: true });
 
+    const commitSha = this.runGit(["rev-parse", "HEAD"]).stdout.trim();
+    this.logger.info("Push completed", {
+      branchName: this.branchName,
+      commitSha
+    });
     return {
       changed: true,
       pushed: true,
       branchName: this.branchName,
-      commitSha: this.runGit(["rev-parse", "HEAD"]).stdout.trim()
+      commitSha
     };
   }
 
@@ -294,6 +368,10 @@ export class Workspace {
       return;
     }
 
+    this.logger.info("Cleaning up workspace", {
+      branchName: this.branchName,
+      branchBase: this.branchBase
+    });
     this.runGit(["checkout", this.branchBase]);
     this.runGit(["pull", "--rebase", "origin", this.branchBase], { authenticated: true });
     this.branchName = null;
@@ -355,10 +433,19 @@ export class Workspace {
   }
 
   runGit(args, options = {}) {
-    return this.runCommand("git", buildAuthenticatedGitArgs(options.authenticated ? this.githubToken : "", args), options);
+    return this.runCommand("git", buildAuthenticatedGitArgs(options.authenticated ? this.githubToken : "", args), {
+      ...options,
+      displayArgs: args
+    });
   }
 
   runCommand(command, args, options = {}) {
+    const displayArgs = options.displayArgs ?? args;
+    const startedAt = Date.now();
+    this.logger.debug("Running command", {
+      command,
+      args: displayArgs
+    });
     const result = spawnSync(command, args, {
       cwd: this.rootDir,
       encoding: "utf8",
@@ -367,14 +454,33 @@ export class Workspace {
     });
 
     if (result.error) {
+      this.logger.error("Command execution threw", {
+        command,
+        args: displayArgs,
+        error: result.error
+      });
       throw result.error;
     }
 
     if (!options.allowFailure && result.status !== 0) {
+      this.logger.error("Command failed", {
+        command,
+        args: displayArgs,
+        status: result.status,
+        durationMs: Date.now() - startedAt,
+        output: summarizeOutput(`${result.stdout}${result.stderr}`)
+      });
       throw new Error(
-        `${command} ${args.join(" ")} failed with code ${result.status}: ${truncate(`${result.stdout}${result.stderr}`.trim())}`
+        `${command} ${displayArgs.join(" ")} failed with code ${result.status}: ${truncate(`${result.stdout}${result.stderr}`.trim())}`
       );
     }
+
+    this.logger.debug("Command completed", {
+      command,
+      args: displayArgs,
+      status: result.status ?? 0,
+      durationMs: Date.now() - startedAt
+    });
 
     return {
       status: result.status ?? 0,

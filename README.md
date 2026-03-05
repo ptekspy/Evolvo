@@ -44,6 +44,7 @@ MAX_ISSUE_ATTEMPTS=3
 MAX_PR_FIX_ROUNDS=3
 MAX_AGENT_STEPS=40
 COMMAND_TIMEOUT_MS=120000
+LOG_LEVEL=info
 LOOP_DELAY_MS=2000
 DRY_RUN=true
 ```
@@ -53,6 +54,7 @@ DRY_RUN=true
 - The repo must be clean before a live run. Untracked `.env*` files and `.evolvo/` are allowed; other local changes will block execution.
 - `pnpm start` loads `.env` automatically on Node 22+.
 - The configured GitHub token must have issue, PR, and push permissions for the target repo.
+- Console logging is controlled by `LOG_LEVEL` with `debug`, `info`, `warn`, and `error`.
 
 ## Run
 

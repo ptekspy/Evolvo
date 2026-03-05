@@ -1,4 +1,5 @@
 import { composePrompt } from "./masterPrompt.js";
+import { createNoopLogger } from "./logger.js";
 
 const ACTIONS = new Set([
   "list_files",
@@ -57,12 +58,55 @@ function validateAction(parsed) {
   return parsed;
 }
 
+function summarizeAction(action) {
+  switch (action.action) {
+    case "list_files":
+      return {
+        action: action.action,
+        glob: action.glob ?? null
+      };
+    case "search_code":
+      return {
+        action: action.action,
+        query: action.query
+      };
+    case "read_files":
+      return {
+        action: action.action,
+        pathCount: action.paths.length,
+        paths: action.paths
+      };
+    case "write_file":
+      return {
+        action: action.action,
+        path: action.path,
+        contentBytes: Buffer.byteLength(action.content, "utf8")
+      };
+    case "delete_file":
+      return {
+        action: action.action,
+        path: action.path
+      };
+    case "finish":
+      return {
+        action: action.action,
+        summary: action.summary,
+        prTitle: action.prTitle ?? null
+      };
+    default:
+      return {
+        action: action.action
+      };
+  }
+}
+
 export class ExecutionSession {
   constructor(planner, workspace, options = {}) {
     this.planner = planner;
     this.workspace = workspace;
     this.maxSteps = options.maxSteps ?? 40;
     this.maxMalformedResponses = options.maxMalformedResponses ?? 3;
+    this.logger = options.logger ?? createNoopLogger();
   }
 
   async run(issue, options = {}) {
@@ -84,9 +128,18 @@ export class ExecutionSession {
         });
         action = response.action;
         malformedResponses = response.malformedResponses;
+        this.logger.info("Planner selected action", {
+          step,
+          malformedResponses,
+          ...summarizeAction(action)
+        });
       } catch (error) {
         if (error.retryable) {
           malformedResponses = error.malformedResponses;
+          this.logger.warn("Planner output invalid; retrying next step", {
+            malformedResponses,
+            error: error.message
+          });
           history.push({
             role: "system",
             text: `Planner output was invalid and will be retried.\n${error.message}`
@@ -104,6 +157,11 @@ export class ExecutionSession {
       }
 
       const outcome = this.applyAction(action, latestValidation);
+      this.logger.debug("Action result", {
+        step,
+        action: action.action,
+        message: outcome.message
+      });
       history.push({
         role: "tool",
         text: `Action: ${JSON.stringify(action)}\nResult:\n${outcome.message}`
@@ -114,6 +172,10 @@ export class ExecutionSession {
       }
 
       if (outcome.finished) {
+        this.logger.info("Execution session finished", {
+          step,
+          summary: action.summary
+        });
         return {
           status: "done",
           summary: action.summary,
@@ -139,6 +201,11 @@ export class ExecutionSession {
   async requestAction(context) {
     let malformedResponses = context.malformedResponses ?? 0;
     const prompt = this.composePrompt(context);
+    this.logger.debug("Requesting planner action", {
+      step: context.step,
+      promptLength: prompt.length,
+      malformedResponses
+    });
     const initial = await this.planner.complete(prompt);
 
     try {
@@ -148,6 +215,11 @@ export class ExecutionSession {
       };
     } catch (error) {
       malformedResponses += 1;
+      this.logger.warn("Planner returned malformed JSON", {
+        step: context.step,
+        malformedResponses,
+        error: error.message
+      });
       if (malformedResponses >= this.maxMalformedResponses) {
         throw new Error(`Malformed planner response limit reached. Last error: ${error.message}`);
       }
@@ -162,6 +234,11 @@ export class ExecutionSession {
         };
       } catch (repairError) {
         malformedResponses += 1;
+        this.logger.warn("Planner repair response was malformed", {
+          step: context.step,
+          malformedResponses,
+          error: repairError.message
+        });
         if (malformedResponses >= this.maxMalformedResponses) {
           throw new Error(`Malformed planner response limit reached. Last error: ${repairError.message}`);
         }

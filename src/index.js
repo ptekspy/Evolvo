@@ -1,6 +1,7 @@
 import { readConfig } from "./config.js";
 import { Evolver } from "./evolver.js";
 import { GitHubClient } from "./github.js";
+import { ConsoleLogger } from "./logger.js";
 import { PerformanceTracker } from "./performance.js";
 import { FallbackProvider } from "./providers/fallback.js";
 import { OllamaProvider } from "./providers/ollama.js";
@@ -10,14 +11,32 @@ import { Workspace } from "./workspace.js";
 async function main() {
   process.loadEnvFile?.(".env");
   const config = readConfig();
+  const logger = new ConsoleLogger({
+    level: config.logLevel,
+    scope: "evolvo"
+  });
 
-  const ollama = new OllamaProvider(config.ollamaBaseUrl, config.ollamaModel);
+  logger.info("Loaded configuration", {
+    repo: `${config.githubOwner}/${config.githubRepo}`,
+    dryRun: config.dryRun,
+    ollamaModel: config.ollamaModel,
+    openAiModel: config.openAiModel,
+    openAiFallback: Boolean(config.openAiApiKey),
+    maxIssueAttempts: config.maxIssueAttempts,
+    maxPrFixRounds: config.maxPrFixRounds,
+    maxAgentSteps: config.maxAgentSteps,
+    loopDelayMs: config.loopDelayMs,
+    commandTimeoutMs: config.commandTimeoutMs,
+    logLevel: config.logLevel
+  });
+
+  const ollama = new OllamaProvider(config.ollamaBaseUrl, config.ollamaModel, logger.child("provider.ollama"));
   const openAiFallback = config.openAiApiKey
-    ? new OpenAiProvider(config.openAiApiKey, config.openAiModel)
+    ? new OpenAiProvider(config.openAiApiKey, config.openAiModel, logger.child("provider.openai"))
     : null;
 
-  const planner = new FallbackProvider(ollama, openAiFallback);
-  const reviewer = new FallbackProvider(ollama, openAiFallback);
+  const planner = new FallbackProvider(ollama, openAiFallback, logger.child("planner"));
+  const reviewer = new FallbackProvider(ollama, openAiFallback, logger.child("reviewer"));
 
   const evolver = new Evolver(
     planner,
@@ -26,7 +45,8 @@ async function main() {
       owner: config.githubOwner,
       repo: config.githubRepo,
       token: config.githubToken,
-      dryRun: config.dryRun
+      dryRun: config.dryRun,
+      logger: logger.child("github")
     }),
     new PerformanceTracker(".evolvo/performance.json"),
     {
@@ -35,13 +55,16 @@ async function main() {
       maxAgentSteps: config.maxAgentSteps,
       loopDelayMs: config.loopDelayMs,
       dryRun: config.dryRun,
+      logger: logger.child("runner"),
       workspaceFactory: () => new Workspace(process.cwd(), {
         githubToken: config.githubToken,
-        commandTimeoutMs: config.commandTimeoutMs
+        commandTimeoutMs: config.commandTimeoutMs,
+        logger: logger.child("workspace")
       })
     }
   );
 
+  logger.info("Starting run loop");
   await evolver.run();
 }
 

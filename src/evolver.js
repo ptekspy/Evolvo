@@ -1,5 +1,6 @@
 import { ExecutionSession } from "./executionSession.js";
 import { buildIssueMarker } from "./github.js";
+import { createNoopLogger } from "./logger.js";
 import { composePrompt } from "./masterPrompt.js";
 
 const IN_PROGRESS_LABEL = "in-progress";
@@ -41,6 +42,7 @@ export class Evolver {
     this.reviewer = reviewer;
     this.github = github;
     this.performance = performance;
+    this.logger = options.logger ?? createNoopLogger();
     this.options = {
       maxIssueAttempts: options.maxIssueAttempts ?? 3,
       maxPrFixRounds: options.maxPrFixRounds ?? 3,
@@ -54,21 +56,32 @@ export class Evolver {
   }
 
   async run() {
+    this.logger.info("Ensuring prompt issue exists");
     await this.github.ensurePromptIssue();
 
     let loopCount = 0;
     while (loopCount < this.options.maxLoops) {
       loopCount += 1;
+      this.logger.info("Starting loop iteration", {
+        loopCount
+      });
       const issue = await this.chooseNextActionableIssue();
 
       if (!issue) {
         this.idleLoopCount += 1;
+        this.logger.info("No actionable issues found", {
+          idleLoopCount: this.idleLoopCount
+        });
         await this.planUpgradeIssues();
         await this.sleep(this.options.loopDelayMs);
         continue;
       }
 
       this.idleLoopCount = 0;
+      this.logger.info("Selected issue for execution", {
+        issueNumber: issue.number,
+        title: issue.title
+      });
       await this.log(issue.number, `🚀 Starting autonomous work on issue #${issue.number}: ${issue.title}`);
       const outcome = await this.processIssue(issue);
 
@@ -97,21 +110,35 @@ export class Evolver {
       return null;
     }
 
+    this.logger.debug("Evaluating actionable issues", {
+      issueNumbers: actionable.map((issue) => issue.number)
+    });
     const decision = await this.rankIssueChoices(actionable);
     if (decision.action === "create" && Array.isArray(decision.issues) && decision.issues.length > 0) {
       const first = decision.issues[0];
       const created = await this.createIssueIfMissing(first.title, first.body, ["self-evolution"]);
       const existing = actionable.find((issue) => issue.number === created.issueNumber);
+      this.logger.info("Planner requested creation before work", {
+        issueNumber: created.issueNumber,
+        created: created.created,
+        title: first.title
+      });
       return existing ?? { number: created.issueNumber, title: first.title, body: first.body, labels: [{ name: "self-evolution" }] };
     }
 
     if (decision.action === "work" && Number.isInteger(decision.issueNumber)) {
       const picked = actionable.find((issue) => issue.number === decision.issueNumber);
       if (picked) {
+        this.logger.info("Planner selected issue", {
+          issueNumber: picked.number
+        });
         return picked;
       }
     }
 
+    this.logger.warn("Planner selection was invalid; defaulting to first actionable issue", {
+      issueNumber: actionable[0].number
+    });
     return actionable[0];
   }
 
@@ -133,8 +160,13 @@ export class Evolver {
     ].join("\n"));
 
     try {
-      return JSON.parse(await this.planner.complete(prompt));
+      const parsed = JSON.parse(await this.planner.complete(prompt));
+      this.logger.debug("Issue ranking response parsed", {
+        action: parsed.action ?? null
+      });
+      return parsed;
     } catch {
+      this.logger.warn("Issue ranking response was invalid; using fallback issue selection");
       return { action: "work", issueNumber: actionable[0].number };
     }
   }
@@ -151,6 +183,10 @@ export class Evolver {
     let status = "blocked";
 
     await this.github.addLabels(issue.number, [IN_PROGRESS_LABEL]);
+    this.logger.info("Processing issue", {
+      issueNumber: issue.number,
+      title: issue.title
+    });
 
     try {
       const branchName = workspace.prepareBranch(issue);
@@ -181,6 +217,10 @@ export class Evolver {
 
       const publication = await this.publishExecution(issue, workspace, execution);
       prNumber = publication.pr.number;
+      this.logger.info("Execution published to pull request", {
+        issueNumber: issue.number,
+        prNumber
+      });
       const reviewOutcome = await this.reviewMergeAndRestart(issue, publication.pr, workspace, execution.validation, execution);
       reviewRounds = reviewOutcome.reviewRounds;
       validationPassed = reviewOutcome.validationPassed;
@@ -190,6 +230,10 @@ export class Evolver {
       return reviewOutcome;
     } catch (error) {
       status = "failed";
+      this.logger.error("Issue processing failed", {
+        issueNumber: issue.number,
+        error
+      });
       await this.log(issue.number, `💥 Execution failed: ${error.message}`);
       await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
       try {
@@ -213,7 +257,7 @@ export class Evolver {
       }
 
       await this.github.removeLabels(issue.number, [IN_PROGRESS_LABEL]);
-      this.performance.record({
+      const snapshot = this.performance.record({
         timestamp: new Date().toISOString(),
         issueNumber: issue.number,
         status,
@@ -224,14 +268,23 @@ export class Evolver {
         merged,
         durationMs: Date.now() - startedAt
       });
+      this.logger.info("Recorded performance snapshot", snapshot);
     }
   }
 
   async executeIssueAttempt(issue, workspace, options = {}) {
     const session = new ExecutionSession(this.planner, workspace, {
-      maxSteps: this.options.maxAgentSteps
+      maxSteps: this.options.maxAgentSteps,
+      logger: this.logger.child("session", {
+        issueNumber: issue.number,
+        attempt: options.attempt ?? 1
+      })
     });
 
+    this.logger.info("Starting execution session", {
+      issueNumber: issue.number,
+      attempt: options.attempt ?? 1
+    });
     return session.run(issue, options);
   }
 
@@ -241,6 +294,10 @@ export class Evolver {
     const result = workspace.commitAndPush(issue, prTitle);
 
     if (!result.changed || !result.pushed) {
+      this.logger.error("Execution could not be published", {
+        issueNumber: issue.number,
+        reason: result.reason ?? "unknown"
+      });
       throw new Error(`Unable to publish execution: ${result.reason ?? "commit or push failed."}`);
     }
 
@@ -270,6 +327,11 @@ export class Evolver {
     let currentExecution = execution;
 
     for (let round = 1; round <= this.options.maxPrFixRounds; round += 1) {
+      this.logger.info("Starting review round", {
+        issueNumber: issue.number,
+        prNumber: currentPr.number,
+        round
+      });
       const review = await this.generateReview(issue, currentPr, round, workspace, currentValidation);
       await this.github.reviewPullRequest(currentPr.number, review);
       await this.log(issue.number, `🔍 Review round ${round}/${this.options.maxPrFixRounds}: ${review.decision}. rationale: ${review.rationale ?? "n/a"}`);
@@ -282,6 +344,10 @@ export class Evolver {
 
         const merged = await this.github.mergePullRequest(currentPr.number);
         if (merged) {
+          this.logger.info("Pull request merged", {
+            issueNumber: issue.number,
+            prNumber: currentPr.number
+          });
           await this.log(issue.number, `✅ PR #${currentPr.number} merged. Syncing with ${workspace.branchBase}.`);
           await this.github.closeIssue(issue.number);
           if (this.options.dryRun) {
@@ -330,6 +396,10 @@ export class Evolver {
       currentPr = publication.pr;
     }
 
+    this.logger.warn("Review loop exhausted without approval", {
+      issueNumber: issue.number,
+      prNumber: currentPr.number
+    });
     await this.github.addLabels(issue.number, [NEEDS_HUMAN_LABEL]);
     await this.log(issue.number, `⛔ PR loop exhausted. Added label: ${NEEDS_HUMAN_LABEL}.`);
     return {
@@ -357,12 +427,23 @@ export class Evolver {
     try {
       const response = await this.reviewer.complete(prompt);
       const parsed = JSON.parse(response);
+      this.logger.debug("Parsed review response", {
+        issueNumber: issue.number,
+        prNumber: pr.number,
+        round,
+        decision: parsed.decision ?? null
+      });
       return {
         decision: parsed.decision === "request_changes" ? "request_changes" : "approve",
         body: parsed.body ?? "Automated self-review completed.",
         rationale: parsed.rationale ?? "Reviewed against autonomous quality policy."
       };
     } catch {
+      this.logger.warn("Reviewer response was invalid; defaulting to request_changes", {
+        issueNumber: issue.number,
+        prNumber: pr.number,
+        round
+      });
       return {
         decision: "request_changes",
         body: "Automated reviewer could not validate this PR; requesting another fix cycle.",
@@ -385,7 +466,12 @@ export class Evolver {
       const parsed = JSON.parse(await this.planner.complete(prompt));
       planned = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
       requestChallenge = Boolean(parsed.requestChallenge) || requestChallenge;
+      this.logger.info("Planned idle upgrade issues", {
+        plannedCount: planned.length,
+        requestChallenge
+      });
     } catch {
+      this.logger.warn("Idle planning response was invalid; using fallback upgrade issue");
       planned = [
         {
           title: "Improve Evolvo issue execution reliability",
@@ -397,6 +483,10 @@ export class Evolver {
     for (const item of planned) {
       const created = await this.createIssueIfMissing(item.title, item.body, ["self-evolution"]);
       if (created.created) {
+        this.logger.info("Created self-evolution issue", {
+          issueNumber: created.issueNumber,
+          title: item.title
+        });
         await this.log(created.issueNumber, "🧭 Created by autonomous self-planning cycle with rationale-driven prioritization.");
       }
     }
@@ -408,6 +498,9 @@ export class Evolver {
         ["challenge-request", "self-evolution"]
       );
       if (challengeIssue.created) {
+        this.logger.info("Created challenge request issue", {
+          issueNumber: challengeIssue.issueNumber
+        });
         await this.log(challengeIssue.issueNumber, "🧪 Challenge request opened to benchmark progress.");
       }
       this.idleLoopCount = 0;
@@ -417,12 +510,20 @@ export class Evolver {
   async createIssueIfMissing(title, body, labels) {
     const existing = await this.github.findOpenIssueByTitle(title);
     if (existing) {
+      this.logger.info("Reusing existing issue instead of creating duplicate", {
+        issueNumber: existing.number,
+        title
+      });
       return {
         issueNumber: existing.number,
         created: false
       };
     }
 
+    this.logger.info("Creating new issue", {
+      title,
+      labels
+    });
     return {
       issueNumber: await this.github.createIssue(title, body, labels),
       created: true
@@ -439,6 +540,10 @@ export class Evolver {
 
   async log(issueNumber, message) {
     const timestamp = new Date().toISOString();
+    this.logger.info("Issue event", {
+      issueNumber,
+      message
+    });
     await this.github.commentOnIssue(issueNumber, `[${timestamp}] ${message}`);
   }
 
