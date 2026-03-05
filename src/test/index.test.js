@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { main, restartProcess } from "../index.js";
+import { installDependencies, main, restartProcess } from "../index.js";
 
 class StubLogger {
   constructor(scope = "evolvo", entries = []) {
@@ -51,6 +51,32 @@ function createConfig(overrides = {}) {
   };
 }
 
+test("installDependencies runs pnpm install with defaults", () => {
+  let spawned = null;
+  const child = { status: 0 };
+
+  const result = installDependencies({
+    cwd: "/tmp/evolvo",
+    env: { TEST_ENV: "1" },
+    logger: new StubLogger(),
+    spawnImpl(command, args, options) {
+      spawned = { command, args, options };
+      return child;
+    }
+  });
+
+  assert.equal(result, child);
+  assert.deepEqual(spawned, {
+    command: "pnpm",
+    args: ["install", "--frozen-lockfile"],
+    options: {
+      cwd: "/tmp/evolvo",
+      env: { TEST_ENV: "1" },
+      stdio: "inherit"
+    }
+  });
+});
+
 test("restartProcess spawns a detached replacement process", () => {
   let spawned = null;
   let unrefCalled = false;
@@ -87,7 +113,9 @@ test("restartProcess spawns a detached replacement process", () => {
   assert.equal(unrefCalled, true);
 });
 
-test("main relaunches the process when a live run requests restart", async () => {
+test("main installs dependencies before relaunch when a live run requests restart", async () => {
+  const callOrder = [];
+  let installCall = null;
   let restartCall = null;
   const logger = new StubLogger();
 
@@ -100,10 +128,18 @@ test("main relaunches the process when a live run requests restart", async () =>
     GitHubClientClass: class {},
     PerformanceTrackerClass: class {},
     WorkspaceClass: class {},
+    installDependencies(options) {
+      callOrder.push("install");
+      installCall = options;
+      return { status: 0 };
+    },
     restartProcess(options) {
+      callOrder.push("restart");
       restartCall = options;
       return { pid: 123, unref() {} };
     },
+    installCommand: "pnpm",
+    installArgs: ["install"],
     execPath: "/usr/bin/node",
     args: ["src/index.js"],
     cwd: "/tmp/evolvo",
@@ -111,12 +147,17 @@ test("main relaunches the process when a live run requests restart", async () =>
   });
 
   assert.equal(result.restartRequested, true);
+  assert.deepEqual(callOrder, ["install", "restart"]);
+  assert.equal(Boolean(installCall), true);
+  assert.equal(installCall.command, "pnpm");
+  assert.deepEqual(installCall.args, ["install"]);
   assert.equal(Boolean(restartCall), true);
   assert.equal(restartCall.execPath, "/usr/bin/node");
   assert.deepEqual(restartCall.args, ["src/index.js"]);
 });
 
 test("main skips relaunching when dry-run mode requests restart", async () => {
+  let installInvoked = false;
   let restartInvoked = false;
 
   const result = await main({
@@ -128,6 +169,10 @@ test("main skips relaunching when dry-run mode requests restart", async () => {
     GitHubClientClass: class {},
     PerformanceTrackerClass: class {},
     WorkspaceClass: class {},
+    installDependencies() {
+      installInvoked = true;
+      return { status: 0 };
+    },
     restartProcess() {
       restartInvoked = true;
       return { pid: 123, unref() {} };
@@ -135,5 +180,6 @@ test("main skips relaunching when dry-run mode requests restart", async () => {
   });
 
   assert.equal(result.restartRequested, true);
+  assert.equal(installInvoked, false);
   assert.equal(restartInvoked, false);
 });
