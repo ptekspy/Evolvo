@@ -105,7 +105,7 @@ export class ExecutionSession {
     this.planner = planner;
     this.workspace = workspace;
     this.maxSteps = options.maxSteps ?? 40;
-    this.maxMalformedResponses = options.maxMalformedResponses ?? 3;
+    this.maxMalformedResponses = options.maxMalformedResponses ?? 15;
     this.logger = options.logger ?? createNoopLogger();
   }
 
