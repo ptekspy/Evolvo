@@ -91,8 +91,8 @@ DRY_RUN=true
 
 ## Requirements
 
-- The repo must be clean before a live run. Untracked `.env*` files and `.evolvo/` are allowed; other local changes will block execution.
-- `.evolvo/` is runtime state and should stay untracked.
+- The repo must be clean before a live run. Untracked `.env*`, `.evolvo/`, `dist/`, `node_modules/`, `pnpm-lock.yaml`, and `tsconfig.tsbuildinfo` are treated as local runtime/tooling artifacts; other local changes still block execution.
+- `.evolvo/`, `dist/`, `node_modules/`, `pnpm-lock.yaml`, and `tsconfig.tsbuildinfo` should stay untracked in this repo.
 - `pnpm start` loads `.env` automatically on Node 22+.
 - The configured GitHub token must have issue, PR, and push permissions for the target repo.
 - `PRIMARY_MODEL_PROVIDER=openai` requires `OPENAI_API_KEY`.

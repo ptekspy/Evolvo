@@ -6,7 +6,21 @@ import { createNoopLogger } from "./logger.js";
 const DEFAULT_BRANCH = "main";
 const DEFAULT_MAX_COMMAND_OUTPUT = 12000;
 const SEARCH_RESULT_LIMIT = 200;
-const PROTECTED_DIRECTORIES = [".git", "node_modules", ".evolvo"];
+const PROTECTED_DIRECTORIES = [".git", "dist", "node_modules", ".evolvo"];
+const ALLOWED_UNTRACKED_PATHS = [
+  ".env",
+  ".evolvo",
+  "dist",
+  "node_modules",
+  "pnpm-lock.yaml",
+  "tsconfig.tsbuildinfo"
+];
+const ALLOWED_UNTRACKED_PREFIXES = [
+  ".env.",
+  ".evolvo/",
+  "dist/",
+  "node_modules/"
+];
 
 function truncate(text, limit = DEFAULT_MAX_COMMAND_OUTPUT) {
   if (text.length <= limit) {
@@ -50,10 +64,8 @@ function isProtectedPath(path) {
 
 function isAllowedDirtyPath(entry) {
   return entry.code === "??" && (
-    entry.path === ".env"
-    || entry.path.startsWith(".env.")
-    || entry.path === ".evolvo"
-    || entry.path.startsWith(".evolvo/")
+    ALLOWED_UNTRACKED_PATHS.includes(entry.path)
+    || ALLOWED_UNTRACKED_PREFIXES.some((prefix) => entry.path.startsWith(prefix))
   );
 }
 

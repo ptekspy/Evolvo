@@ -53,14 +53,20 @@ test("buildAuthenticatedGitArgs injects a per-command auth header", () => {
   assert.deepEqual(args.slice(2), ["push", "origin", "HEAD"]);
 });
 
-test("Workspace prepareBranch allows .env and .evolvo but blocks other dirty files", () => {
+test("Workspace prepareBranch allows generated local artifacts but blocks unrelated dirty files", () => {
   const { repoDir, remoteDir } = createRepo();
   const workspace = new Workspace(repoDir, { commandTimeoutMs: 10000 });
 
   try {
     mkdirSync(join(repoDir, ".evolvo"), { recursive: true });
+    mkdirSync(join(repoDir, "dist"), { recursive: true });
+    mkdirSync(join(repoDir, "node_modules", ".bin"), { recursive: true });
     writeFileSync(join(repoDir, ".evolvo", "state.json"), "{}\n");
     writeFileSync(join(repoDir, ".env"), "TOKEN=value\n");
+    writeFileSync(join(repoDir, "dist", "index.js"), "console.log('built');\n");
+    writeFileSync(join(repoDir, "node_modules", ".bin", "tsc"), "#!/bin/sh\n");
+    writeFileSync(join(repoDir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    writeFileSync(join(repoDir, "tsconfig.tsbuildinfo"), "{}\n");
     workspace.assertCleanWorktree();
 
     writeFileSync(join(repoDir, "notes.txt"), "dirty\n");
