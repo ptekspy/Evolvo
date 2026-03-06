@@ -33,6 +33,11 @@ interface ReviewDecision {
   rationale?: string;
 }
 
+interface PlannedIssue {
+  title: string;
+  body: string;
+}
+
 interface PullRequest {
   number: number;
   title?: string;
@@ -89,6 +94,7 @@ interface GitHubLike {
 
 interface PerformanceLike {
   record(snapshot: Record<string, JsonValue>): Record<string, JsonValue>;
+  latest?(): Record<string, JsonValue> | undefined;
 }
 
 interface EvolverOptions {
@@ -199,6 +205,7 @@ export class Evolver {
       if (!issue) {
         this.idleLoopCount += 1;
         this.logger.info("No actionable issues found", { idleLoopCount: this.idleLoopCount });
+        await this.planUpgradeIssues();
         await this.sleep(this.options.loopDelayMs);
         continue;
       }
@@ -231,35 +238,79 @@ export class Evolver {
     }
 
     const decision = await this.rankIssueChoices(actionable);
+    if (decision.action === "create" && Array.isArray(decision.issues) && decision.issues.length > 0) {
+      const firstTitle = decision.issues[0]?.title;
+      const firstBody = decision.issues[0]?.body;
+      if (!firstTitle || !firstBody) {
+        return actionable[0] ?? null;
+      }
+      const created = await this.createIssueIfMissing(firstTitle, firstBody, ["self-evolution"]);
+      const existing = actionable.find((issue) => issue.number === created.issueNumber);
+      this.logger.info("Planner requested creation before work", {
+        issueNumber: created.issueNumber,
+        created: created.created,
+        title: firstTitle
+      });
+      return existing ?? {
+        number: created.issueNumber,
+        title: firstTitle,
+        body: firstBody,
+        labels: [{ name: "self-evolution" }]
+      };
+    }
+
     if (decision.action === "work" && Number.isInteger(decision.issueNumber)) {
       const picked = actionable.find((issue) => issue.number === decision.issueNumber);
       if (picked) {
+        this.logger.info("Planner selected issue", {
+          issueNumber: picked.number
+        });
         return picked;
       }
     }
 
+    this.logger.warn("Planner selection was invalid; defaulting to first actionable issue", {
+      issueNumber: actionable[0]?.number ?? null
+    });
     return actionable[0] ?? null;
   }
 
-  private async rankIssueChoices(actionable: Issue[]): Promise<{ action: string; issueNumber?: number }> {
+  private async rankIssueChoices(actionable: Issue[]): Promise<{ action: string; issueNumber?: number; issues?: PlannedIssue[] }> {
     const summarized = actionable.map((issue) => ({ number: issue.number, title: issue.title, labels: labelsOf(issue) }));
     const prompt = composePrompt([
       "You are autonomously choosing the next issue to work on.",
+      "You may either pick one open issue or decide to create a new self-evolution issue first.",
       `Open issues: ${JSON.stringify(summarized)}`,
       "Return JSON only:",
-      '{"action":"work","issueNumber":123}'
+      '{"action":"work","issueNumber":123}',
+      "or",
+      '{"action":"create","issues":[{"title":"...","body":"..."}]}'
     ].join("\n"));
 
     try {
-      const parsed = JSON.parse(await this.planner.complete(prompt)) as { action: string; issueNumber?: number };
+      const parsed = JSON.parse(await this.planner.complete(prompt)) as { action: string; issueNumber?: number; issues?: PlannedIssue[] };
+      this.logger.debug("Issue ranking response parsed", {
+        action: parsed.action ?? null
+      });
       return parsed;
     } catch {
-      const fallback: { action: string; issueNumber?: number } = { action: "work" };
+      this.logger.warn("Issue ranking response was invalid; using fallback issue selection");
+      const fallback: { action: string; issueNumber?: number; issues?: PlannedIssue[] } = { action: "work" };
       if (actionable[0]) {
         fallback.issueNumber = actionable[0].number;
       }
       return fallback;
     }
+  }
+
+  private async createIssueIfMissing(title: string, body: string, labels: string[] = []): Promise<{ created: boolean; issueNumber: number }> {
+    const existing = await this.github.findOpenIssueByTitle(title);
+    if (existing) {
+      return { created: false, issueNumber: existing.number };
+    }
+
+    const issueNumber = await this.github.createIssue(title, body, labels);
+    return { created: true, issueNumber };
   }
 
   private createWorkspace(): WorkspaceLike {
@@ -337,6 +388,64 @@ export class Evolver {
 
   private async log(issueNumber: number, message: string): Promise<void> {
     await this.github.commentOnIssue(issueNumber, message);
+  }
+
+  private async planUpgradeIssues(): Promise<void> {
+    const baseline = this.performance.latest?.();
+    const prompt = composePrompt([
+      "No open actionable issues remain. Plan autonomous upgrades.",
+      `Current performance: ${baseline ? JSON.stringify(baseline) : "no history yet"}`,
+      'Return JSON object: {"issues":[{"title":"...","body":"..."}],"requestChallenge":true|false}.'
+    ].join("\n"));
+
+    let planned: PlannedIssue[] = [];
+    let requestChallenge = this.idleLoopCount > 2;
+    try {
+      const parsed = JSON.parse(await this.planner.complete(prompt)) as PlannedIssue[] | {
+        issues?: PlannedIssue[];
+        requestChallenge?: boolean;
+      };
+      planned = Array.isArray(parsed) ? parsed : (parsed.issues ?? []);
+      requestChallenge = (Array.isArray(parsed) ? false : Boolean(parsed.requestChallenge)) || requestChallenge;
+      this.logger.info("Planned idle upgrade issues", {
+        plannedCount: planned.length,
+        requestChallenge
+      });
+    } catch {
+      this.logger.warn("Idle planning response was invalid; using fallback upgrade issue");
+      planned = [
+        {
+          title: "Improve Evolvo issue execution reliability",
+          body: "Increase success rate for autonomous issue completion and reduce stuck loops."
+        }
+      ];
+    }
+
+    for (const item of planned) {
+      const created = await this.createIssueIfMissing(item.title, item.body, ["self-evolution"]);
+      if (created.created) {
+        this.logger.info("Created self-evolution issue", {
+          issueNumber: created.issueNumber,
+          title: item.title
+        });
+        await this.log(created.issueNumber, "🧭 Created by autonomous self-planning cycle with rationale-driven prioritization.");
+      }
+    }
+
+    if (requestChallenge) {
+      const challengeIssue = await this.createIssueIfMissing(
+        "Challenge request: evaluate Evolvo capability growth",
+        "I request a new human-defined challenge to verify my current capability and guide the next evolution step.",
+        ["challenge-request", "self-evolution"]
+      );
+      if (challengeIssue.created) {
+        this.logger.info("Created challenge request issue", {
+          issueNumber: challengeIssue.issueNumber
+        });
+        await this.log(challengeIssue.issueNumber, "🧪 Challenge request opened to benchmark progress.");
+      }
+      this.idleLoopCount = 0;
+    }
   }
 
   private async sleep(ms: number): Promise<void> {
